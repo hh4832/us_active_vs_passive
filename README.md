@@ -129,7 +129,7 @@ The production notebook is `notebooks/us_active_vs_passive_colab.ipynb`. Before 
 - permission to mount Google Drive; and
 - the actual mounted `MyDrive` output path.
 
-The configured Drive folder ID identifies the intended folder, but it is not a Linux filesystem path. After mounting Drive in Colab, set `DRIVE_OUTPUT_ROOT` to that folder's real path under `/content/drive/MyDrive/`. If the folder name or location differs, only this parameter needs to change.
+The configured Drive folder ID identifies the intended folder, but it is not a Linux filesystem path. After mounting Drive in Colab, the default is `DRIVE_OUTPUT_ROOT = "/content/drive/MyDrive/Quant_Research/us_active_vs_passive"`. If the folder name or location differs, only this parameter needs to change.
 
 Run the notebook from top to bottom. It clones the latest `main`, installs dependencies, loads the Tiingo token, accepts the Firstrade export, requires the complete unit-test suite to pass, runs the production pipeline, displays the main results, and copies the timestamped run folder to Drive.
 
