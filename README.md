@@ -88,6 +88,23 @@ pytest -q
 
 Place the private broker export in `data/raw/`; this directory is ignored by Git. Do not commit tokens or Google credentials.
 
+## Google Colab
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/hh4832/us_active_vs_passive/blob/main/notebooks/us_active_vs_passive_colab.ipynb)
+
+The production notebook is `notebooks/us_active_vs_passive_colab.ipynb`. Before running it, prepare:
+
+- a Colab Secret named `FINLAB_API_TOKEN`;
+- one Firstrade CSV or Excel export;
+- permission to mount Google Drive; and
+- the actual mounted `MyDrive` output path.
+
+The configured Drive folder ID identifies the intended folder, but it is not a Linux filesystem path. After mounting Drive in Colab, set `DRIVE_OUTPUT_ROOT` to that folder's real path under `/content/drive/MyDrive/`. If the folder name or location differs, only this parameter needs to change.
+
+Run the notebook from top to bottom. It clones the latest `main`, installs dependencies, authenticates FinLab, accepts the Firstrade export, requires all 13 unit tests to pass, runs the production pipeline, displays the main results, and copies the timestamped run folder to Drive.
+
+The notebook is an execution and review interface, not the source of the analysis logic. Production accounting, benchmarking, attribution, and reporting remain in `src/` and `scripts/run_analysis.py`.
+
 ## Run
 
 ```bash
@@ -136,4 +153,3 @@ outputs/      ignored generated artifacts
 The pipeline checks its internal daily accounting identity. True broker reconciliation additionally needs the latest Firstrade holdings and ending account value; absent inputs are explicitly marked `NOT_PROVIDED`, never treated as matched. Differences above `$1` or `0.01%` must be investigated.
 
 Interpretation must acknowledge the short 2026 YTD period, limited regime coverage, non-random portfolio formation, contribution timing, missing intraday timestamps, price-scale conversion, incomplete fee/tax fields, differing universes, and the inability of short-period results to establish durable alpha.
-
