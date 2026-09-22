@@ -26,14 +26,17 @@ def time_weighted_returns(nav: pd.Series, external_cash_flow: pd.Series) -> pd.S
 
 def reconstruct_portfolio(
     transactions: pd.DataFrame,
-    adj_close: pd.DataFrame,
+    prices: pd.DataFrame,
     *,
     included_tickers: set[str] | None = None,
     allow_negative: bool = False,
+    execution_price_column: str = "adjusted_execution_price",
 ) -> AccountingResult:
     """Reconstruct cash, holdings, NAV, TWR and same-day P&L decomposition.
 
-    Execution prices must already be expressed on the adjusted-price scale.
+    Execution prices and valuation prices must use the same scale. Production
+    actual-account reconstruction passes raw Tiingo close prices together with
+    the broker's raw execution prices and actual cash dividends.
     Transactions without intraday timestamps are applied at their recorded fill,
     and remaining holdings are marked to that day's close.
     """
@@ -44,7 +47,9 @@ def reconstruct_portfolio(
         tx = tx[security | cash_only].copy()
     if tx.empty:
         raise ValueError("No transactions remain for portfolio reconstruction")
-    prices = adj_close.sort_index().copy().ffill()
+    if execution_price_column not in tx.columns:
+        raise ValueError(f"Missing execution price column: {execution_price_column}")
+    prices = prices.sort_index().copy()
     start = min(tx["date"].dropna().min(), prices.index.min())
     end = prices.index.max()
     dates = prices.loc[start:end].index
@@ -60,6 +65,15 @@ def reconstruct_portfolio(
     for date in dates:
         today_prices = prices.loc[date]
         day_tx = tx[tx["date"].eq(date)]
+        required_today = {
+            str(t) for t, qty in positions.items() if abs(qty) > 1e-12
+        } | set(day_tx.loc[day_tx["type"].isin(["buy", "sell"]), "ticker"].dropna().astype(str))
+        missing_today = sorted(
+            ticker for ticker in required_today
+            if ticker not in prices.columns or pd.isna(today_prices.get(ticker)) or float(today_prices[ticker]) <= 0
+        )
+        if missing_today:
+            raise ValueError(f"Missing held/traded market price on {date.date()}: {missing_today}")
         existing_pnl = 0.0 if previous_prices is None else sum(
             qty * (float(today_prices[t]) - float(previous_prices[t]))
             for t, qty in positions.items() if qty and pd.notna(today_prices.get(t)) and pd.notna(previous_prices.get(t))
@@ -100,9 +114,9 @@ def reconstruct_portfolio(
                 continue
             ticker = str(row["ticker"])
             if ticker not in prices.columns:
-                warnings.append(f"Skipped row {idx}: no adjusted price series for {ticker}")
+                warnings.append(f"Skipped row {idx}: no market price series for {ticker}")
                 continue
-            execution = float(row["adjusted_execution_price"])
+            execution = float(row[execution_price_column])
             quantity = float(row["quantity"])
             fee = float(row.get("fee", 0) or 0)
             close = float(today_prices[ticker])
@@ -145,13 +159,24 @@ def reconstruct_portfolio(
     return AccountingResult(daily, pd.DataFrame(holding_rows), pd.DataFrame(ledger_rows), warnings)
 
 
-def reconstruct_next_day_sensitivity(transactions: pd.DataFrame, adj_close: pd.DataFrame, **kwargs) -> AccountingResult:
+def reconstruct_next_day_sensitivity(
+    transactions: pd.DataFrame,
+    prices: pd.DataFrame,
+    *,
+    execution_price_column: str = "adjusted_execution_price",
+    **kwargs,
+) -> AccountingResult:
     shifted = transactions.copy()
-    trading_dates = pd.Index(adj_close.index)
+    trading_dates = pd.Index(prices.index)
     def next_date(value: pd.Timestamp) -> pd.Timestamp:
         pos = trading_dates.searchsorted(value, side="right")
         return trading_dates[min(pos, len(trading_dates) - 1)]
     trade_mask = shifted["type"].isin(["buy", "sell"])
     shifted.loc[trade_mask, "date"] = shifted.loc[trade_mask, "date"].map(next_date)
-    shifted.loc[trade_mask, "adjusted_execution_price"] = [adj_close.loc[d, t] for d, t in zip(shifted.loc[trade_mask, "date"], shifted.loc[trade_mask, "ticker"])]
-    return reconstruct_portfolio(shifted, adj_close, **kwargs)
+    shifted.loc[trade_mask, execution_price_column] = [
+        prices.loc[d, t]
+        for d, t in zip(shifted.loc[trade_mask, "date"], shifted.loc[trade_mask, "ticker"])
+    ]
+    return reconstruct_portfolio(
+        shifted, prices, execution_price_column=execution_price_column, **kwargs,
+    )

@@ -47,3 +47,27 @@ def test_external_cash_flow_does_not_change_twr(dates):
     assert result.iloc[1] == pytest.approx(0)
     assert result.iloc[2] == pytest.approx(0)
 
+
+def test_raw_close_plus_actual_dividend_does_not_double_count_distribution(dates):
+    tx = make_tx([
+        {"date": dates[0], "type": "deposit", "cash_flow": 100},
+        {"date": dates[0], "type": "buy", "ticker": "ABC", "quantity": 1,
+         "price": 100, "raw_execution_price": 100},
+        {"date": dates[1], "type": "dividend", "ticker": "ABC", "dividend": 1},
+    ])
+    raw_close = pd.DataFrame({"ABC": [100, 99, 99]}, index=dates)
+    result = reconstruct_portfolio(
+        tx, raw_close, execution_price_column="raw_execution_price",
+    )
+    assert result.daily.loc[dates[1], "nav"] == pytest.approx(100)
+    assert result.daily.loc[dates[1], "investment_pnl"] == pytest.approx(0)
+
+
+def test_held_position_missing_price_is_not_forward_filled(dates):
+    tx = make_tx([
+        {"date": dates[0], "type": "buy", "ticker": "ABC", "quantity": 1,
+         "price": 100, "raw_execution_price": 100},
+    ])
+    raw_close = pd.DataFrame({"ABC": [100, float("nan"), 102]}, index=dates)
+    with pytest.raises(ValueError, match="Missing held/traded market price"):
+        reconstruct_portfolio(tx, raw_close, execution_price_column="raw_execution_price")

@@ -26,6 +26,7 @@ benchmarks:
   vgt: {VGT: 1.0}
   voo_sgov_80_20: {VOO: 0.8, SGOV: 0.2}
   vgt_sgov_80_20: {VGT: 0.8, SGOV: 0.2}
+# Legacy FinLab loader hint; ignored by the Tiingo-only production runner.
 known_funds: [GLD, VOO, VGT, SGOV, SYSB]
 column_aliases:
   date: [date, trade_date, transaction_date, 日期, 交易日期]

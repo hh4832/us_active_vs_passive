@@ -11,6 +11,9 @@ def cashflow_matched_benchmark(external_flows: pd.Series, prices: pd.DataFrame, 
     missing = set(weights) - set(prices.columns)
     if missing:
         raise ValueError(f"Missing benchmark prices: {sorted(missing)}")
+    invalid = prices[list(weights)].isna() | prices[list(weights)].le(0)
+    if invalid.any().any():
+        raise ValueError("Missing/invalid benchmark market prices; silent ffill is prohibited")
     idx = prices.index
     flows = external_flows.reindex(idx, fill_value=0.0)
     shares = {t: 0.0 for t in weights}
@@ -49,4 +52,3 @@ def volatility_matched_weights(active_returns: pd.Series, voo_returns: pd.Series
     vols = [(w * aligned.iloc[:, 1] + (1 - w) * aligned.iloc[:, 2]).std() for w in grid]
     weight = float(grid[int(np.argmin(np.abs(np.asarray(vols) - target)))])
     return {"VOO": weight, "SGOV": 1 - weight}
-

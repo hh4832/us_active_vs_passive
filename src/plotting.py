@@ -15,7 +15,7 @@ def _save(fig, path: Path, note: str) -> None:
     plt.close(fig)
 
 
-def create_standard_figures(returns: pd.DataFrame, output_dir: str | Path, note: str = "Source: Firstrade + FinLab; adjusted-price methodology") -> None:
+def create_standard_figures(returns: pd.DataFrame, output_dir: str | Path, note: str = "Source: Firstrade + Tiingo EOD") -> None:
     output = Path(output_dir); output.mkdir(parents=True, exist_ok=True)
     date_range = f"{returns.index.min().date()} to {returns.index.max().date()}"
     wealth = (1 + returns.fillna(0)).cumprod()
@@ -35,7 +35,7 @@ def create_standard_figures(returns: pd.DataFrame, output_dir: str | Path, note:
             fig, ax = plt.subplots(figsize=(10, 5)); excess.plot(ax=ax, label=f"Active minus {benchmark.upper()}"); ax.axhline(0, color="gray", linewidth=.8); ax.set(title=f"Cumulative excess return vs {benchmark.upper()} ({date_range})", ylabel="Relative wealth - 1", xlabel="Date"); ax.legend(); _save(fig, output / f"excess_vs_{benchmark}.png", note)
 
 
-def create_account_figures(daily: pd.DataFrame, holdings: pd.DataFrame, ticker_summary: pd.DataFrame, output_dir: str | Path, note: str = "Source: Firstrade + FinLab") -> None:
+def create_account_figures(daily: pd.DataFrame, holdings: pd.DataFrame, ticker_summary: pd.DataFrame, output_dir: str | Path, note: str = "Source: Firstrade actual fills/dividends + Tiingo raw close") -> None:
     output = Path(output_dir); output.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(10, 5)); daily[["cash", "market_value"]].plot.area(ax=ax); ax.set(title="Portfolio exposure over time", ylabel="USD-equivalent value", xlabel="Date"); _save(fig, output / "allocation_over_time.png", note)
     if not holdings.empty:

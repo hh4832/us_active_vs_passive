@@ -17,9 +17,7 @@ sys.path.insert(0, str(ROOT))
 from src.attribution import fifo_realized_pnl, ticker_summary
 from src.benchmarks import beta_matched_weights, cashflow_matched_benchmark, volatility_matched_weights
 from src.drawdown import drawdown_episodes, drawdown_series
-from src.external_price_loader import empty_external_price_bundle, load_external_prices
 from src.export import base_run_info, create_run_directory, write_json
-from src.finlab_loader import load_finlab_prices
 from src.load_transactions import load_transactions
 from src.normalize_transactions import audit_transactions, normalize_transactions
 from src.performance import performance_metrics, relative_metrics
@@ -27,6 +25,7 @@ from src.plotting import create_account_figures, create_standard_figures
 from src.portfolio_accounting import reconstruct_next_day_sensitivity, reconstruct_portfolio
 from src.price_adjustment import attach_adjusted_execution_prices
 from src.regime import capture_ratios, regime_analysis
+from src.tiingo_loader import audit_tiingo_coverage, load_tiingo_prices
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,8 +33,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("transactions", type=Path, help="Firstrade CSV/XLSX")
     parser.add_argument("--config", type=Path, default=ROOT / "config/config.yaml")
     parser.add_argument("--outputs", type=Path, default=ROOT / "outputs")
-    parser.add_argument("--fallback-prices", type=Path, default=ROOT / "data/fallback_prices.csv",
-                        help="Optional audited external CSV for tickers absent from FinLab")
     parser.add_argument("--upload", action="store_true", help="Upload run folder using an existing rclone remote")
     parser.add_argument("--rclone-remote", default="gdrive")
     return parser.parse_args()
@@ -59,20 +56,19 @@ def main() -> int:
 
     universe = sorted(tx.loc[tx.type.isin(["buy", "sell"]), "ticker"].dropna().unique())
     required = sorted(set(universe) | {"VOO", "VGT", "SGOV"})
-    bundle = load_finlab_prices(required, cfg.get("known_funds", []))
-    missing_finlab = set(required) - set(bundle.adj_close.columns)
-    external = (
-        load_external_prices(args.fallback_prices, required_tickers=missing_finlab)
-        if missing_finlab
-        else empty_external_price_bundle()
-    )
-    available_external = sorted(missing_finlab & set(external.adj_close.columns))
-    if available_external:
-        bundle.close = pd.concat([bundle.close, external.close[available_external]], axis=1).sort_index()
-        bundle.adj_close = pd.concat([bundle.adj_close, external.adj_close[available_external]], axis=1).sort_index()
-        bundle.classification.update({ticker: external.sources[ticker] for ticker in available_external})
+    bundle = load_tiingo_prices(required, start_date=tx["date"].dropna().min())
+    coverage = audit_tiingo_coverage(bundle, tx, actual_tickers=set(universe))
+    coverage.ticker_coverage.to_csv(run / "trades/ticker_coverage_audit.csv", index=False)
+    coverage.trade_date_coverage.to_csv(run / "trades/trade_date_coverage_audit.csv", index=False)
+    coverage.holding_period_coverage.to_csv(run / "trades/holding_period_coverage.csv", index=False)
+    coverage.corporate_actions.to_csv(run / "trades/corporate_actions.csv", index=False)
+    if not coverage.passed:
+        raise RuntimeError(
+            "Tiingo price coverage failed; see ticker_coverage_audit.csv, "
+            "trade_date_coverage_audit.csv, and holding_period_coverage.csv"
+        )
     tx, adjustment_warnings = attach_adjusted_execution_prices(
-        tx, bundle.close, bundle.adj_close, price_sources=bundle.classification,
+        tx, bundle.close, bundle.adj_close, price_sources={ticker: "tiingo" for ticker in required},
     )
     price_audit_columns = [
         "source_row", "date", "ticker", "type", "raw_execution_price", "close", "adj_close",
@@ -83,7 +79,7 @@ def main() -> int:
         run / "trades/price_resolution_audit.csv", index=False,
     )
     fatal_trade_adjustments = tx.type.isin(["buy", "sell"]) & tx.adjusted_execution_price.isna()
-    warnings = audit.warnings + bundle.warnings + external.warnings + adjustment_warnings
+    warnings = audit.warnings + adjustment_warnings
     if fatal_trade_adjustments.any():
         write_json(run / "metadata/warnings.json", warnings)
         unresolved = tx.loc[fatal_trade_adjustments, ["source_row", "date", "ticker", "type", "warning"]]
@@ -98,7 +94,9 @@ def main() -> int:
     results = {}
     for name, definition in definitions.items():
         included = set(universe) - set(definition.get("exclude", []))
-        results[name] = reconstruct_portfolio(tx, bundle.adj_close, included_tickers=included)
+        results[name] = reconstruct_portfolio(
+            tx, bundle.close, included_tickers=included, execution_price_column="raw_execution_price",
+        )
         results[name].daily.to_csv(run / f"daily/{name}_daily_nav.csv")
         results[name].holdings.to_csv(run / f"daily/{name}_daily_holdings.csv", index=False)
         warnings.extend(results[name].warnings)
@@ -111,16 +109,18 @@ def main() -> int:
 
     flows = actual.daily.external_cash_flow
     benchmark_frames = {}
+    benchmark_prices = bundle.adj_close.reindex(actual.daily.index)
     for name, weights in cfg["benchmarks"].items():
-        benchmark_frames[name] = cashflow_matched_benchmark(flows, bundle.adj_close.reindex(actual.daily.index).ffill(), weights)
+        benchmark_frames[name] = cashflow_matched_benchmark(flows, benchmark_prices, weights)
     active = results["active_equity_sleeve"].daily.twr
-    voo_ret = bundle.adj_close.VOO.pct_change().reindex(active.index)
-    vgt_ret = bundle.adj_close.VGT.pct_change().reindex(active.index)
-    sgov_ret = bundle.adj_close.SGOV.pct_change().reindex(active.index)
+    voo_ret = bundle.adj_close.VOO.pct_change(fill_method=None).reindex(active.index)
+    vgt_ret = bundle.adj_close.VGT.pct_change(fill_method=None).reindex(active.index)
+    sgov_ret = bundle.adj_close.SGOV.pct_change(fill_method=None).reindex(active.index)
     beta = relative_metrics(active, voo_ret)["beta"]
     dynamic = {"beta_matched_voo_sgov": beta_matched_weights(beta),
                "volatility_matched_voo_sgov": volatility_matched_weights(active, voo_ret, sgov_ret)}
-    for name, weights in dynamic.items(): benchmark_frames[name] = cashflow_matched_benchmark(flows, bundle.adj_close.reindex(actual.daily.index).ffill(), weights)
+    for name, weights in dynamic.items():
+        benchmark_frames[name] = cashflow_matched_benchmark(flows, benchmark_prices, weights)
     pd.concat({k: v.nav for k, v in benchmark_frames.items()}, axis=1).to_csv(run / "benchmarks/cashflow_matched_benchmarks.csv")
 
     returns = pd.concat({k: v.daily.twr for k, v in results.items()} | {k: v["return"] for k, v in benchmark_frames.items()}, axis=1)
@@ -144,11 +144,15 @@ def main() -> int:
                             "beta_60_vs_voo": active.rolling(60).cov(voo_ret) / voo_ret.rolling(60).var(),
                             "corr_60_vs_voo": active.rolling(60).corr(voo_ret)})
     rolling.to_csv(run / "risk/rolling_metrics.csv")
-    fifo_realized_pnl(tx).to_csv(run / "trades/realized_pnl_fifo.csv", index=False)
-    tickers = ticker_summary(tx, bundle.adj_close.reindex(actual.daily.index).ffill().iloc[-1])
+    fifo_realized_pnl(tx, price_column="raw_execution_price").to_csv(run / "trades/realized_pnl_fifo.csv", index=False)
+    tickers = ticker_summary(
+        tx, bundle.close.reindex(actual.daily.index).iloc[-1], price_column="raw_execution_price",
+    )
     tickers.to_csv(run / "trades/ticker_summary.csv", index=False)
 
-    sensitivity = reconstruct_next_day_sensitivity(tx, bundle.adj_close, included_tickers=active_included)
+    sensitivity = reconstruct_next_day_sensitivity(
+        tx, bundle.close, included_tickers=active_included, execution_price_column="raw_execution_price",
+    )
     pd.DataFrame([{"convention": "actual_fill", **performance_metrics(active)},
                   {"convention": "next_day", **performance_metrics(sensitivity.daily.twr)}]).to_csv(run / "risk/timing_sensitivity.csv", index=False)
     create_standard_figures(returns[["active_equity_sleeve", "voo", "vgt", "voo_sgov_80_20", "beta_matched_voo_sgov"]], run / "figures")
@@ -162,26 +166,31 @@ def main() -> int:
     reconciliation.to_csv(run / "summary/account_reconciliation.csv", index=False)
     if (reconciliation.status == "WARNING").any(): warnings.append("Accounting reconciliation exceeded tolerance")
 
-    data_sources = ["us_price:close", "us_price:adj_close", "us_fund_price:close", "us_fund_price:adj_close"]
-    if available_external:
-        data_sources.append(str(args.fallback_prices))
+    coverage_status = {
+        "ticker_coverage": "PASS" if coverage.ticker_coverage["status"].eq("PASS").all() else "FAIL",
+        "trade_date_coverage": "PASS" if coverage.trade_date_coverage["status"].eq("PASS").all() else "FAIL",
+        "holding_period_coverage": "PASS" if coverage.holding_period_coverage["status"].eq("PASS").all() else "FAIL",
+    }
     info = base_run_info(args.transactions, analysis_start=actual.daily.index.min(), analysis_end=actual.daily.index.max(),
-                         finlab_data_sources=data_sources,
-                         finlab_latest_date=bundle.adj_close.index.max(), tickers=required, stock_fund_classification=bundle.classification,
+                         price_source="Tiingo", api_latest_date=bundle.latest_date,
+                         coverage_status=coverage_status, tickers=required,
                          detected_columns=detected, risk_free_rate=cfg["risk_free_rate"], annualization_factor=cfg["annualization_factor"],
                          transaction_timing_convention=cfg["transaction_timing"], cash_flow_timing=cfg["cash_flow_timing"],
                          realized_pnl_method=cfg["realized_pnl_method"], portfolio_definitions=definitions,
                          benchmark_definitions=cfg["benchmarks"] | dynamic,
-                         adjustment_methodology="adjusted_execution_price = raw execution price * resolved adj_close/close factor",
+                         actual_account_price_methodology="raw Tiingo close plus actual Firstrade cash dividends",
+                         benchmark_price_methodology="Tiingo adjClose total-return series",
+                         adjustment_methodology="adjusted_execution_price = actual Firstrade fill * Tiingo adjClose/close",
                          price_resolution_policy={
-                             "primary": "exact FinLab factor",
-                             "neighbor_window_calendar_days": 3,
-                             "neighbor_factor_tolerance": 1e-6,
-                             "single_side_max_trading_sessions": 1,
-                             "external_fallback_file": str(args.fallback_prices) if available_external else None,
+                             "primary": "exact Tiingo EOD close and adjClose",
+                             "missing_trade_or_held_position_price": "fatal",
+                             "silent_forward_fill": False,
                          }, warnings=warnings)
     write_json(run / "metadata/run_info.json", info)
-    write_json(run / "metadata/data_sources.json", info["finlab_data_sources"])
+    write_json(run / "metadata/data_sources.json", {
+        "price_source": "Tiingo", "endpoint": "tiingo/daily/{ticker}/prices",
+        "fields": ["close", "adjClose", "divCash", "splitFactor"],
+    })
     write_json(run / "metadata/warnings.json", warnings)
     conclusion = ROOT / "templates/research_conclusion_template.md"
     shutil.copy2(conclusion, run / "summary/research_conclusion.md")

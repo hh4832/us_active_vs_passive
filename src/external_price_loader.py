@@ -1,3 +1,5 @@
+"""Legacy manual fallback loader; not used by the Tiingo-only production path."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

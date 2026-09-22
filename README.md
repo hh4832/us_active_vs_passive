@@ -7,33 +7,33 @@ Reproducible research pipeline for comparing a real Firstrade active portfolio w
 The repository contains the complete analysis framework and synthetic unit tests. A real research run requires:
 
 - a Firstrade CSV or Excel export;
-- `FINLAB_API_TOKEN` in the environment;
+- `TIINGO_API_TOKEN` in the environment;
 - optional preconfigured `rclone` access for Google Drive upload.
 
-The pipeline never silently fixes transaction anomalies. Phase A audit files are written before FinLab retrieval or performance analysis. Missing fields, unsupported activity types, negative positions, unavailable tickers, missing adjustment factors, and unresolved reconciliation items are preserved in the warnings output.
+The production price backend is Tiingo EOD. The pipeline never silently fixes transaction or market-data anomalies. Audit files are written before performance analysis; unsupported activity types, negative positions, unavailable tickers, missing trade-date prices, missing held-position prices, and unresolved reconciliation items remain visible or fatal as appropriate.
 
-### Audited external price fallback
+### Tiingo production prices
 
-FinLab remains the primary price source. If a real holding is absent from both FinLab US stock and fund datasets, an optional `data/fallback_prices.csv` may provide an externally reviewed series:
+For every actual-account and benchmark ticker, production retrieves at least:
 
-```csv
-date,ticker,close,adj_close,source,no_corporate_action_confirmed
-2026-01-05,EXAMPLE,100.00,99.50,external_manual,
-```
+- `close` — raw end-of-day close;
+- `adjClose` — split- and dividend-adjusted total-return close;
+- `divCash` — cash distribution on the ex-date; and
+- `splitFactor` — split/distribution adjustment factor.
 
-The first five columns are required. `adj_close` may be blank only when `no_corporate_action_confirmed` is explicitly set to `true` after confirming that no split or corporate action occurred; the pipeline then uses a factor of 1.0 and records a warning. The repository does not download, invent, or silently forward-fill missing execution-date inputs. External data should not be committed unless its provenance and redistribution status are appropriate.
+The pipeline audits ticker coverage, every buy/sell date, every actual holding session, and all returned corporate-action rows. Any missing `close` or `adjClose` on a trade date or actual holding date is fatal. Genuine market-data gaps are never silently forward-filled.
 
-Every run writes `trades/price_resolution_audit.csv`, `trades/negative_holdings_diagnostic.csv`, and transaction-type diagnostic tables before performance reconstruction. Unresolved execution prices remain fatal.
+Every run writes `trades/ticker_coverage_audit.csv`, `trades/trade_date_coverage_audit.csv`, `trades/holding_period_coverage.csv`, `trades/corporate_actions.csv`, `trades/price_resolution_audit.csv`, and transaction diagnostics before performance reconstruction. The old FinLab and manual-fallback loaders remain only as legacy modules and are not imported by the production runner.
 
 ## Methodology
 
 ### Actual-fill reconstruction
 
-Raw broker fills are nominal prices, while FinLab adjusted closes use an adjusted scale. Every buy and sell uses:
+Raw broker fills are nominal prices. An adjusted execution price is retained for audit and adjusted-scale research:
 
 ```text
-adjustment_factor(t)       = adj_close(t) / close(t)
-adjusted_execution_price  = actual_execution_price * adjustment_factor(t)
+adjustment_factor(t)       = Tiingo adjClose(t) / Tiingo close(t)
+adjusted_execution_price  = actual Firstrade fill * adjustment_factor(t)
 ```
 
 Daily investment P&L is decomposed into:
@@ -46,14 +46,14 @@ existing-position market P&L
 - fees
 ```
 
-Without intraday timestamps, external cash flows are assumed available before that day's close. The main analysis applies actual recorded fills and marks the remaining position at close. A next-trading-day sensitivity series is generated separately.
+Without intraday timestamps, external cash flows are assumed available before that day's close. Actual portfolios use the raw Firstrade fill, raw Tiingo close, and actual Firstrade cash dividends. Passive benchmarks and relative-risk series use Tiingo `adjClose`. A next-trading-day sensitivity series is generated separately.
 
-> Important: adjusted prices and cash dividends can overlap economically depending on the vendor's adjustment convention. The pipeline follows the requested total-return-consistent adjusted-price methodology while retaining explicit broker dividends for account reconciliation. Review this treatment against the exact FinLab adjustment definition before interpreting economic attribution.
+This raw-price actual-account path prevents the broker's cash dividend from being counted again through a dividend-adjusted market-price series.
 
 ### NAV and returns
 
 ```text
-NAV(t) = cash(t) + sum(shares(i,t) * adjusted_market_price(i,t))
+NAV(t) = cash(t) + sum(shares(i,t) * raw_market_close(i,t))
 TWR(t) = (NAV(t) - external_cash_flow(t)) / NAV(t-1) - 1
 ```
 
@@ -96,7 +96,7 @@ Sharpe and Sortino are produced both with `rf = 0` and the configurable annual r
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-export FINLAB_API_TOKEN='...'
+export TIINGO_API_TOKEN='...'
 pytest -q
 ```
 
@@ -108,14 +108,14 @@ Place the private broker export in `data/raw/`; this directory is ignored by Git
 
 The production notebook is `notebooks/us_active_vs_passive_colab.ipynb`. Before running it, prepare:
 
-- a Colab Secret named `FINLAB_API_TOKEN`;
+- a Colab Secret named `TIINGO_API_TOKEN`;
 - one Firstrade CSV or Excel export;
 - permission to mount Google Drive; and
 - the actual mounted `MyDrive` output path.
 
 The configured Drive folder ID identifies the intended folder, but it is not a Linux filesystem path. After mounting Drive in Colab, set `DRIVE_OUTPUT_ROOT` to that folder's real path under `/content/drive/MyDrive/`. If the folder name or location differs, only this parameter needs to change.
 
-Run the notebook from top to bottom. It clones the latest `main`, installs dependencies, authenticates FinLab, accepts the Firstrade export, requires the complete unit-test suite to pass, runs the production pipeline, displays the main results, and copies the timestamped run folder to Drive.
+Run the notebook from top to bottom. It clones the latest `main`, installs dependencies, loads the Tiingo token, accepts the Firstrade export, requires the complete unit-test suite to pass, runs the production pipeline, displays the main results, and copies the timestamped run folder to Drive.
 
 The notebook is an execution and review interface, not the source of the analysis logic. Production accounting, benchmarking, attribution, and reporting remain in `src/` and `scripts/run_analysis.py`.
 
@@ -140,14 +140,14 @@ Each run creates `outputs/run_YYYYMMDD_HHMMSS/` with:
 ```text
 summary/     performance tables, reconciliation, conclusion template
 daily/       NAV, TWR, holdings, exposure, drawdown
-trades/      audit, normalized fills, FIFO realized P&L, ticker summary
+trades/      coverage/corporate-action audits, normalized fills, FIFO P&L, ticker summary
 risk/        episodes, regimes, capture, rolling and matched results
 benchmarks/  cash-flow-matched benchmark series
 figures/     equity, drawdown and rolling-risk charts
 metadata/    run info, data sources and warnings
 ```
 
-`run_info.json` records the input hash, dates, sources, classifications, assumptions, portfolio definitions, benchmark weights, software versions, git SHA, and all warnings.
+`run_info.json` records `price_source = Tiingo`, Tiingo's API latest date, coverage status, input hash, analysis dates, assumptions, portfolio definitions, benchmark weights, software versions, git SHA, and all warnings.
 
 ## Repository structure
 
@@ -166,4 +166,4 @@ outputs/      ignored generated artifacts
 
 The pipeline checks its internal daily accounting identity. True broker reconciliation additionally needs the latest Firstrade holdings and ending account value; absent inputs are explicitly marked `NOT_PROVIDED`, never treated as matched. Differences above `$1` or `0.01%` must be investigated.
 
-Interpretation must acknowledge the short 2026 YTD period, limited regime coverage, non-random portfolio formation, contribution timing, missing intraday timestamps, price-scale conversion, incomplete fee/tax fields, differing universes, and the inability of short-period results to establish durable alpha.
+Interpretation must acknowledge the short 2026 YTD period, limited regime coverage, non-random portfolio formation, contribution timing, missing intraday timestamps, incomplete fee/tax fields, differing universes, vendor adjustment conventions, and the inability of short-period results to establish durable alpha.

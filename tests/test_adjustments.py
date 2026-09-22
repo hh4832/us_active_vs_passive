@@ -19,3 +19,14 @@ def test_adjusted_execution_price_conversion():
 def test_invalid_adjustment_inputs_fail():
     with pytest.raises(ValueError): adjustment_factor(0, 10)
 
+
+def test_exact_tiingo_factor_is_not_reported_as_external_fallback():
+    date = pd.Timestamp("2026-01-02")
+    tx = make_tx([{"date": date, "type": "buy", "ticker": "ABC", "quantity": 1, "price": 100}])
+    close = pd.DataFrame({"ABC": [100]}, index=[date])
+    adj = pd.DataFrame({"ABC": [99]}, index=[date])
+    result, warnings = attach_adjusted_execution_prices(
+        tx, close, adj, price_sources={"ABC": "tiingo"},
+    )
+    assert not warnings
+    assert result.loc[0, "adjustment_source"] == "exact_tiingo"

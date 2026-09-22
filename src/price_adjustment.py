@@ -50,6 +50,8 @@ def _session_distance(index: pd.Index, date: pd.Timestamp, reference: pd.Timesta
 def _source_name(provider: str, resolution: str) -> str:
     if provider in {"finlab", "stock", "fund"}:
         return resolution
+    if provider == "tiingo" and resolution == "exact_finlab":
+        return "exact_tiingo"
     if resolution == "exact_finlab":
         return f"exact_{provider}"
     return f"{provider}_{resolution}"
@@ -87,7 +89,7 @@ def attach_adjusted_execution_prices(
             source = _source_name(provider, "exact_finlab")
             reference_date = date
             date_shift = 0
-            if provider not in {"finlab", "stock", "fund"}:
+            if provider not in {"finlab", "stock", "fund", "tiingo"}:
                 warning = f"Row {idx} {ticker} {date.date()}: used audited external price source {provider}"
                 if "no_corporate_action_factor_1" in provider:
                     warning += "; adjustment factor 1.0 depends on explicit no-corporate-action confirmation"

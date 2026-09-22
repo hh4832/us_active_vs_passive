@@ -1,3 +1,10 @@
+"""Legacy FinLab price loader.
+
+Production analysis uses :mod:`src.tiingo_loader`. This module is retained only
+for reproducibility of historical experiments and is not imported by the
+production runner.
+"""
+
 from __future__ import annotations
 
 import os
@@ -46,4 +53,3 @@ def load_finlab_prices(tickers: list[str], known_funds: list[str] | None = None)
     if not adj_parts:
         raise ValueError("No requested tickers were available from FinLab")
     return PriceBundle(pd.concat(close_parts, axis=1).sort_index(), pd.concat(adj_parts, axis=1).sort_index(), classification, warnings)
-

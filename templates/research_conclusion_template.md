@@ -25,9 +25,8 @@
 - It may represent only one market regime; portfolio formation was not random.
 - Contribution timing affects money-weighted returns.
 - Without intraday timestamps, transaction timing is approximated.
-- Nominal fills require conversion to the adjusted-price scale.
+- Actual-account NAV uses raw Tiingo closes and raw Firstrade fills; adjusted fills are retained only for audit and adjusted-scale research.
 - Taxes are excluded unless explicitly present in the source transactions.
 - Fees depend on completeness of the Firstrade export.
 - Survivorship bias is limited for actually traded securities, but universes differ.
 - Short-period results cannot prove long-run alpha.
-
