@@ -3,6 +3,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from .portfolio_accounting import time_weighted_returns
+
 
 def cashflow_matched_benchmark(external_flows: pd.Series, prices: pd.DataFrame, weights: dict[str, float]) -> pd.DataFrame:
     """Invest every contribution on the same date, allowing fractional shares."""
@@ -33,8 +35,7 @@ def cashflow_matched_benchmark(external_flows: pd.Series, prices: pd.DataFrame, 
         nav = sum(shares[t] * float(prices.loc[date, t]) for t in weights)
         rows.append({"date": date, "nav": nav, "external_cash_flow": flow, **{f"shares_{t}": q for t, q in shares.items()}})
     result = pd.DataFrame(rows).set_index("date")
-    previous = result["nav"].shift(1)
-    result["return"] = (result["nav"] - result["external_cash_flow"]) / previous - 1
+    result["return"] = time_weighted_returns(result["nav"], result["external_cash_flow"])
     return result
 
 

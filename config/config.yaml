@@ -8,6 +8,12 @@ reconciliation_tolerance_usd: 1.0
 reconciliation_tolerance_pct: 0.0001
 google_drive_folder_id: 1NlsfPTDpI1hDRso6NwERT7xYvlLOe1g2
 portfolio_definitions:
+  active_equity_selection:
+    exclude: [VOO, VGT, SGOV, SYSB, GLD]
+    include_cash: true
+  active_discretionary_risk:
+    exclude: [VOO, VGT, SGOV, SYSB]
+    include_cash: true
   active_risk_assets:
     exclude: [VOO, VGT, SGOV, SYSB]
     include_cash: true
@@ -39,3 +45,4 @@ column_aliases:
   dividend: [dividend, dividend_amount, 股息]
   cash_flow: [cash_flow, deposit_withdrawal, 入金出金, 入金 / 出金]
   fee: [fee, fees, commission, 手續費, 費用]
+  description: [description, memo, details, 說明, 摘要]

@@ -19,10 +19,11 @@ from src.benchmarks import beta_matched_weights, cashflow_matched_benchmark, vol
 from src.drawdown import drawdown_episodes, drawdown_series
 from src.export import base_run_info, create_run_directory, write_json
 from src.load_transactions import load_transactions
-from src.normalize_transactions import audit_transactions, normalize_transactions
+from src.normalize_transactions import audit_transactions, normalize_transactions, unresolved_cash_affecting_rows
+from src.new_money_cohort import build_new_money_cohort, summarize_new_money_result
 from src.performance import performance_metrics, relative_metrics
 from src.plotting import create_account_figures, create_since_start_figures, create_standard_figures
-from src.portfolio_accounting import reconstruct_next_day_sensitivity, reconstruct_portfolio
+from src.portfolio_accounting import reconstruct_portfolio
 from src.price_adjustment import attach_adjusted_execution_prices
 from src.regime import capture_ratios, regime_analysis
 from src.strategy_reset import (
@@ -62,6 +63,20 @@ def main() -> int:
     write_json(run / "metadata/warnings.json", audit.warnings)
 
     strategy_start = pd.Timestamp(cfg["analysis_start_date"]).normalize()
+    unknown_cash_affecting = unresolved_cash_affecting_rows(tx)
+    if not unknown_cash_affecting.empty:
+        raise RuntimeError(
+            "Unknown transaction rows with non-zero amount may affect cash/NAV; "
+            "see trades/unrecognized_transaction_types.csv"
+        )
+    split_descriptions = tx["description"].str.contains(r"\b(?:STK|STOCK)\s+SPLIT\b", case=False, regex=True, na=False)
+    if (split_descriptions & ~tx["type"].eq("split")).any():
+        raise RuntimeError("A stock split was classified as an ordinary transaction")
+    invalid_splits = tx["type"].eq("split") & (
+        tx["price"].fillna(0.0).abs().gt(1e-12) | tx["amount"].fillna(0.0).abs().gt(1e-12)
+    )
+    if invalid_splits.any():
+        raise RuntimeError("Split rows must have zero execution price and zero cash amount")
     if not audit.negative_holdings.empty:
         negative_dates = pd.to_datetime(audit.negative_holdings["date"])
         pre_start_negative = audit.negative_holdings.loc[negative_dates.le(strategy_start)]
@@ -107,7 +122,6 @@ def main() -> int:
     tx.to_csv(run / "trades/normalized_transactions.csv", index=False)
 
     definitions = cfg["portfolio_definitions"]
-    active_included = set(universe) - set(definitions["active_equity_sleeve"].get("exclude", []))
     results = {}
     for name, definition in definitions.items():
         included = set(universe) - set(definition.get("exclude", []))
@@ -151,6 +165,114 @@ def main() -> int:
 
     since_index = full_reset.daily.index
     since_prices = bundle.adj_close.reindex(since_index)
+
+    # Primary research: only active-security lots bought on/after the start
+    # date.  Pre-start positions never enter these ledgers.
+    equity_definition = definitions["active_equity_selection"]
+    discretionary_definition = definitions["active_discretionary_risk"]
+    equity_tickers = set(universe) - set(equity_definition.get("exclude", []))
+    discretionary_tickers = set(universe) - set(discretionary_definition.get("exclude", []))
+    new_money_equity = build_new_money_cohort(
+        "new_money_active_equity", tx, bundle.close, strategy_start, equity_tickers,
+        execution_price_column="raw_execution_price",
+    )
+    new_money_discretionary = build_new_money_cohort(
+        "new_money_active_discretionary", tx, bundle.close, strategy_start, discretionary_tickers,
+        execution_price_column="raw_execution_price",
+    )
+    for cohort in [new_money_equity, new_money_discretionary]:
+        cohort.daily.to_csv(run / f"daily/{cohort.name}_daily_nav.csv")
+        cohort.holdings.to_csv(run / f"daily/{cohort.name}_daily_holdings.csv", index=False)
+        warnings.extend(cohort.warnings)
+    pd.DataFrame([
+        {"cohort": new_money_equity.name, "research_start_date": strategy_start,
+         "opening_shares": 0.0, "opening_cash": 0.0, "opening_nav": 0.0},
+        {"cohort": new_money_discretionary.name, "research_start_date": strategy_start,
+         "opening_shares": 0.0, "opening_cash": 0.0, "opening_nav": 0.0},
+    ]).to_csv(run / "summary/new_money_cohort_opening_state.csv", index=False)
+    pd.concat(
+        [new_money_equity.trade_audit, new_money_discretionary.trade_audit], ignore_index=True,
+    ).to_csv(run / "trades/new_money_cohort_trade_audit.csv", index=False)
+    pd.concat(
+        [new_money_equity.dividend_audit, new_money_discretionary.dividend_audit], ignore_index=True,
+    ).to_csv(run / "trades/cohort_dividend_audit.csv", index=False)
+
+    equity_contributions = new_money_equity.cashflows.loc[
+        new_money_equity.cashflows["flow_type"].eq("contribution")
+    ]
+    decision_flows_new_money = equity_contributions.groupby("date")["amount"].sum().reindex(
+        since_index, fill_value=0.0,
+    )
+    new_money_benchmarks = {}
+    new_money_decision_rows = []
+    for benchmark in ["VOO", "VGT"]:
+        key = f"decision_matched_{benchmark.lower()}"
+        frame = cashflow_matched_benchmark(decision_flows_new_money, since_prices, {benchmark: 1.0})
+        frame["market_value"] = frame["nav"]
+        frame["cash"] = 0.0
+        new_money_benchmarks[key] = frame
+        for row in equity_contributions.itertuples(index=False):
+            benchmark_price = float(since_prices.loc[row.date, benchmark])
+            new_money_decision_rows.append({
+                "date": row.date, "active_ticker": row.related_ticker,
+                "active_amount": row.amount, "benchmark": benchmark,
+                "benchmark_price": benchmark_price,
+                "benchmark_shares": row.amount / benchmark_price,
+                "source_row": row.source_row,
+            })
+    pd.DataFrame(new_money_decision_rows).to_csv(
+        run / "benchmarks/decision_matched_transactions.csv", index=False,
+    )
+    pd.concat({name: frame["nav"] for name, frame in new_money_benchmarks.items()}, axis=1).to_csv(
+        run / "benchmarks/new_money_decision_matched_nav.csv",
+    )
+
+    voo_new_money_returns = since_prices["VOO"].pct_change(fill_method=None)
+    new_money_beta = relative_metrics(new_money_equity.daily["twr"], voo_new_money_returns)["beta"]
+    new_money_beta_weights = beta_matched_weights(new_money_beta)
+    beta_matched_new_money = cashflow_matched_benchmark(
+        new_money_equity.daily["external_cash_flow"], since_prices, new_money_beta_weights,
+    )
+    beta_matched_new_money["market_value"] = beta_matched_new_money["nav"]
+    beta_matched_new_money["cash"] = 0.0
+
+    new_money_rows = [
+        summarize_new_money_result(
+            new_money_equity.name, new_money_equity.daily, voo_new_money_returns,
+            risk_free_rate=float(cfg["risk_free_rate"]), annualization=int(cfg["annualization_factor"]),
+            transaction_cashflows=new_money_equity.cashflows,
+        ),
+        summarize_new_money_result(
+            new_money_discretionary.name, new_money_discretionary.daily, voo_new_money_returns,
+            risk_free_rate=float(cfg["risk_free_rate"]), annualization=int(cfg["annualization_factor"]),
+            transaction_cashflows=new_money_discretionary.cashflows,
+        ),
+        summarize_new_money_result(
+            "decision_matched_voo", new_money_benchmarks["decision_matched_voo"], voo_new_money_returns,
+            risk_free_rate=float(cfg["risk_free_rate"]), annualization=int(cfg["annualization_factor"]),
+            transaction_cashflows=equity_contributions,
+        ),
+        summarize_new_money_result(
+            "decision_matched_vgt", new_money_benchmarks["decision_matched_vgt"], voo_new_money_returns,
+            risk_free_rate=float(cfg["risk_free_rate"]), annualization=int(cfg["annualization_factor"]),
+            transaction_cashflows=equity_contributions,
+        ),
+        summarize_new_money_result(
+            "beta_matched_voo_sgov", beta_matched_new_money, voo_new_money_returns,
+            risk_free_rate=float(cfg["risk_free_rate"]), annualization=int(cfg["annualization_factor"]),
+            transaction_cashflows=new_money_equity.cashflows,
+        ),
+    ]
+    new_money_summary = pd.DataFrame(new_money_rows)
+    active_total_contributions = float(equity_contributions["amount"].sum())
+    for benchmark in ["decision_matched_voo", "decision_matched_vgt"]:
+        benchmark_total = float(
+            new_money_summary.loc[new_money_summary["portfolio"].eq(benchmark), "total_contributed_capital"].iloc[0]
+        )
+        if abs(benchmark_total - active_total_contributions) > 0.01:
+            raise RuntimeError(f"{benchmark} contributions do not match active-equity cohort")
+    new_money_summary.to_csv(run / "summary/new_money_cohort_performance.csv", index=False)
+
     full_reset_flows = full_reset.daily["external_cash_flow"].copy()
     full_reset_flows.iloc[0] = float(full_reset.daily.iloc[0]["nav"])
     active_reset_flows = active_reset.daily["external_cash_flow"].copy()
@@ -199,7 +321,9 @@ def main() -> int:
                 "benchmark_price": price, "benchmark_shares": row.active_amount / price,
                 "source_row": row.source_row,
             })
-    pd.DataFrame(decision_rows).to_csv(run / "benchmarks/decision_matched_transactions.csv", index=False)
+    pd.DataFrame(decision_rows).to_csv(
+        run / "benchmarks/decision_matched_transactions_strategy_reset.csv", index=False,
+    )
 
     pd.concat({name: frame["nav"] for name, frame in since_benchmarks.items()}, axis=1).to_csv(
         run / "benchmarks/cashflow_matched_since_start.csv"
@@ -291,19 +415,36 @@ def main() -> int:
     )
     tickers.to_csv(run / "trades/ticker_summary.csv", index=False)
 
-    sensitivity = reconstruct_next_day_sensitivity(
-        tx, bundle.close, included_tickers=active_included, execution_price_column="raw_execution_price",
-    )
-    pd.DataFrame([{"convention": "actual_fill", **performance_metrics(active)},
-                  {"convention": "next_day", **performance_metrics(sensitivity.daily.twr)}]).to_csv(run / "risk/timing_sensitivity.csv", index=False)
+    # A broker ending snapshot is not present in the transaction-history CSV.
+    # Timing sensitivity therefore remains explicitly invalid for performance
+    # interpretation even when the internal accounting identity balances.
+    pd.DataFrame([
+        {"convention": "actual_fill", "status": "INVALID_ACCOUNTING_INPUT",
+         "reason": "broker ending snapshot NOT_PROVIDED", "cumulative_return": None},
+        {"convention": "next_day", "status": "INVALID_ACCOUNTING_INPUT",
+         "reason": "broker ending snapshot NOT_PROVIDED", "cumulative_return": None},
+    ]).to_csv(run / "risk/timing_sensitivity.csv", index=False)
     create_standard_figures(returns[["active_equity_sleeve", "voo", "vgt", "voo_sgov_80_20", "beta_matched_voo_sgov"]], run / "figures")
     create_account_figures(actual.daily, actual.holdings, tickers, run / "figures")
 
     # A zero daily difference demonstrates the accounting identity. Broker ending balance/holdings remain external inputs.
-    reconciliation = pd.DataFrame([{"item": "daily_accounting_identity_max_abs_difference",
-                                    "calculated": actual.daily.reconciliation_difference.abs().max(), "status": "PASS" if actual.daily.reconciliation_difference.abs().max() <= 0.01 else "WARNING"},
-                                   {"item": "broker_ending_nav", "calculated": None, "status": "NOT_PROVIDED"},
-                                   {"item": "broker_latest_holdings", "calculated": None, "status": "NOT_PROVIDED"}])
+    identity_difference = float(actual.daily.reconciliation_difference.abs().max())
+    reconciliation = pd.DataFrame([
+        {"item": "daily_accounting_identity_max_abs_difference", "broker_value": None,
+         "calculated": identity_difference, "difference": identity_difference,
+         "status": "PASS" if identity_difference <= 0.01 else "WARNING"},
+        {"item": "broker_ending_cash", "broker_value": None,
+         "calculated": float(actual.daily.iloc[-1]["cash"]), "difference": None,
+         "status": "NOT_PROVIDED"},
+        {"item": "broker_ending_market_value", "broker_value": None,
+         "calculated": float(actual.daily.iloc[-1]["market_value"]), "difference": None,
+         "status": "NOT_PROVIDED"},
+        {"item": "broker_ending_nav", "broker_value": None,
+         "calculated": float(actual.daily.iloc[-1]["nav"]), "difference": None,
+         "status": "NOT_PROVIDED"},
+        {"item": "broker_ending_holdings_by_ticker", "broker_value": None,
+         "calculated": None, "difference": None, "status": "NOT_PROVIDED"},
+    ])
     reconciliation.to_csv(run / "summary/account_reconciliation.csv", index=False)
     if (reconciliation.status == "WARNING").any(): warnings.append("Accounting reconciliation exceeded tolerance")
 
@@ -315,6 +456,18 @@ def main() -> int:
     info = base_run_info(args.transactions, analysis_start=actual.daily.index.min(), analysis_end=actual.daily.index.max(),
                          price_source="Tiingo", api_latest_date=bundle.latest_date,
                          strategy_start_date=strategy_start,
+                         research_start_date=strategy_start,
+                         research_mode="post_start_new_money_cohort",
+                         transaction_semantic_version="raw_type_plus_description_v2",
+                         transaction_type_counts=tx["type"].value_counts().to_dict(),
+                         unresolved_cash_affecting_rows=len(unknown_cash_affecting),
+                         negative_holding_events=len(audit.negative_holdings),
+                         data_quality_status="PASS",
+                         new_money_total_contributed_capital=active_total_contributions,
+                         new_money_opening_inventory=0.0,
+                         active_equity_exclusions=equity_definition.get("exclude", []),
+                         active_discretionary_exclusions=discretionary_definition.get("exclude", []),
+                         broker_reconciliation_status="NOT_PROVIDED",
                          strategy_start_nav=float(full_reset.daily.iloc[0]["nav"]),
                          active_sleeve_opening_capital=opening_active_capital,
                          strategy_reset_policy={

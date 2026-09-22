@@ -14,6 +14,16 @@ def fifo_realized_pnl(
     lots: dict[str, deque] = defaultdict(deque)
     rows: list[dict] = []
     for idx, row in transactions.sort_values(["date", "source_row"]).iterrows():
+        if row["type"] == "split":
+            ticker = str(row["ticker"])
+            current = sum(lot[0] for lot in lots[ticker])
+            issued = float(row["quantity"])
+            if current <= 0 or issued <= 0:
+                raise ValueError(f"Cannot apply FIFO split for {ticker} at row {idx}")
+            ratio = (current + issued) / current
+            for lot in lots[ticker]:
+                lot[0] *= ratio
+            continue
         if row["type"] not in {"buy", "sell"}:
             continue
         ticker, qty, price = str(row["ticker"]), float(row["quantity"]), float(row[price_column])
@@ -51,7 +61,8 @@ def ticker_summary(
     for ticker, group in transactions.dropna(subset=["ticker"]).groupby("ticker"):
         buys, sells = group[group.type.eq("buy")], group[group.type.eq("sell")]
         buy_qty, sell_qty = buys.quantity.sum(), sells.quantity.sum()
-        ending_qty = buy_qty - sell_qty
+        split_qty = group.loc[group.type.eq("split"), "quantity"].sum()
+        ending_qty = buy_qty + split_qty - sell_qty
         invested = (buys.quantity * buys[price_column]).sum()
         realized = fifo.loc[fifo.ticker.eq(ticker), "realized_pnl"].sum() if not fifo.empty else 0.0
         avg_buy = invested / buy_qty if buy_qty else np.nan

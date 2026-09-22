@@ -82,3 +82,23 @@ def test_tiingo_missing_ticker_is_fatal():
     assert not audit.passed
     assert audit.ticker_coverage.loc[0, "status"] == "FAIL"
     assert audit.trade_date_coverage.loc[0, "status"] == "FAIL"
+
+
+def test_holding_coverage_replays_split_share_issue():
+    payloads = {"ABC": [
+        row("2026-01-02", 800, 100),
+        row("2026-01-05", 100, 100, split=8),
+        row("2026-01-06", 101, 101),
+        row("2026-01-07", 102, 102),
+    ]}
+    bundle = load_tiingo_prices(
+        ["ABC"], start_date="2026-01-02", token="test", session=FakeSession(payloads),
+    )
+    tx = make_tx([
+        {"date": pd.Timestamp("2026-01-02"), "type": "buy", "ticker": "ABC", "quantity": 1},
+        {"date": pd.Timestamp("2026-01-05"), "type": "split", "ticker": "ABC", "quantity": 7},
+        {"date": pd.Timestamp("2026-01-06"), "type": "sell", "ticker": "ABC", "quantity": 8},
+    ])
+    audit = audit_tiingo_coverage(bundle, tx, actual_tickers={"ABC"})
+    assert audit.holding_period_coverage.loc[0, "held_sessions"] == 2
+    assert audit.holding_period_coverage.loc[0, "holding_end"] == pd.Timestamp("2026-01-05")

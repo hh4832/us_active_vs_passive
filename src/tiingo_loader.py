@@ -148,6 +148,9 @@ def audit_tiingo_coverage(
     actual_tickers: set[str],
 ) -> TiingoCoverageAudit:
     trades = transactions.loc[transactions["type"].isin(["buy", "sell"])].copy()
+    position_events = transactions.loc[
+        transactions["type"].isin(["buy", "sell", "split"])
+    ].copy()
     trade_rows: list[dict] = []
     for _, row in trades.iterrows():
         ticker = str(row["ticker"])
@@ -167,11 +170,13 @@ def audit_tiingo_coverage(
     sessions = pd.DatetimeIndex(bundle.close.index).sort_values()
     holding_rows: list[dict] = []
     for ticker in sorted(actual_tickers):
-        ticker_trades = trades.loc[trades["ticker"].eq(ticker)].sort_values(["date", "source_row"])
-        if ticker_trades.empty:
+        ticker_events = position_events.loc[
+            position_events["ticker"].eq(ticker)
+        ].sort_values(["date", "source_row"])
+        if ticker_events.empty:
             continue
         if sessions.empty:
-            missing_dates = sorted(pd.DatetimeIndex(ticker_trades["date"].dropna().unique()))
+            missing_dates = sorted(pd.DatetimeIndex(ticker_events["date"].dropna().unique()))
             holding_rows.append({
                 "ticker": ticker, "holding_start": pd.NaT, "holding_end": pd.NaT,
                 "held_sessions": 0, "covered_sessions": 0,
@@ -182,10 +187,13 @@ def audit_tiingo_coverage(
             continue
         position = 0.0
         held_dates: list[pd.Timestamp] = []
-        for session_date in sessions[sessions >= ticker_trades["date"].min()]:
-            day = ticker_trades.loc[ticker_trades["date"].eq(session_date)]
+        for session_date in sessions[sessions >= ticker_events["date"].min()]:
+            day = ticker_events.loc[ticker_events["date"].eq(session_date)]
             for _, row in day.iterrows():
-                position += float(row["quantity"]) if row["type"] == "buy" else -float(row["quantity"])
+                if row["type"] in {"buy", "split"}:
+                    position += float(row["quantity"])
+                else:
+                    position -= float(row["quantity"])
             if abs(position) > 1e-9:
                 held_dates.append(pd.Timestamp(session_date))
         missing_dates = [

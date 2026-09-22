@@ -37,7 +37,10 @@ def create_standard_figures(returns: pd.DataFrame, output_dir: str | Path, note:
 
 def create_account_figures(daily: pd.DataFrame, holdings: pd.DataFrame, ticker_summary: pd.DataFrame, output_dir: str | Path, note: str = "Source: Firstrade actual fills/dividends + Tiingo raw close") -> None:
     output = Path(output_dir); output.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(10, 5)); daily[["cash", "market_value"]].plot.area(ax=ax); ax.set(title="Portfolio exposure over time", ylabel="USD-equivalent value", xlabel="Date"); _save(fig, output / "allocation_over_time.png", note)
+    # A stacked area chart cannot represent an account whose cash balance
+    # crosses zero (for example, temporary margin use).  Lines preserve both
+    # signs and keep chart generation from becoming a production failure.
+    fig, ax = plt.subplots(figsize=(10, 5)); ax.plot(daily.index, daily["cash"], label="cash"); ax.plot(daily.index, daily["market_value"], label="market_value"); ax.axhline(0.0, color="gray", linewidth=.8); ax.set(title="Portfolio exposure over time", ylabel="USD-equivalent value", xlabel="Date"); ax.legend(); _save(fig, output / "allocation_over_time.png", note)
     if not holdings.empty:
         pivot = holdings.pivot_table(index="date", columns="ticker", values="market_value", aggfunc="sum", fill_value=0)
         total = pivot.sum(axis=1).replace(0, pd.NA)

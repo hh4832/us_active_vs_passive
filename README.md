@@ -27,6 +27,23 @@ Every run writes `trades/ticker_coverage_audit.csv`, `trades/trade_date_coverage
 
 ## Methodology
 
+### Primary research: post-start new-money cohort
+
+The primary research output is `post_start_new_money_cohort`, beginning `2026-04-01`. It starts with zero shares, zero cash, and zero NAV. Pre-start positions remain in full-account reconstruction and the legacy strategy-reset analysis, but they never enter the primary cohort.
+
+Two configured sleeves are reported:
+
+- `new_money_active_equity`: individual stock selection only; excludes VOO, VGT, SGOV, SYSB, and GLD.
+- `new_money_active_discretionary`: individual stocks plus GLD; excludes VOO, VGT, SGOV, and SYSB.
+
+Each post-start active-equity buy contributes its actual gross dollar cost on the same date to contribution-only VOO and VGT counterfactuals. Fractional benchmark shares remain invested through the analysis end. The primary outcomes are ending wealth, dollar P&L, and XIRR/MWR. TWR, volatility, drawdown, Sharpe, Sortino, beta, and capture ratios are secondary because TWR intentionally removes contribution timing.
+
+For the active cohorts, sell proceeds and allocated net broker dividends are recorded as withdrawals. `ending_wealth` is terminal market value plus ending cash plus cumulative withdrawals, and `dollar_pnl = ending_wealth - total_contributed_capital`. This makes the active and contribution-only buy-and-hold counterfactuals comparable without pretending that withdrawn proceeds disappeared.
+
+Broker dividend amounts are treated as net cash. Withholding disclosed only in a dividend description is not deducted again. Cohort dividends are prorated using the broker-reported eligible shares and cohort shares held on the record date; an unparseable allocation remains explicitly warned and unallocated.
+
+Transaction semantics use both Firstrade raw type and description. Account-internal transfers have no economic effect; wire rebates are external non-investment credits; margin interest is investment expense; name changes are zero-effect corporate actions; and zero-price stock-split share issues are bookkeeping rather than buys.
+
 ### Actual-fill reconstruction
 
 Raw broker fills are nominal prices. An adjusted execution price is retained for audit and adjusted-scale research:
@@ -46,7 +63,7 @@ existing-position market P&L
 - fees
 ```
 
-Without intraday timestamps, external cash flows are assumed available before that day's close. Actual portfolios use the raw Firstrade fill, raw Tiingo close, and actual Firstrade cash dividends. Passive benchmarks and relative-risk series use Tiingo `adjClose`. A next-trading-day sensitivity series is generated separately.
+Without intraday timestamps, external cash flows are assumed available before that day's close. Actual portfolios use the raw Firstrade fill, raw Tiingo close, and actual Firstrade cash dividends. Passive benchmarks and relative-risk series use Tiingo `adjClose`. The timing-sensitivity output remains explicitly `INVALID_ACCOUNTING_INPUT` until an independent broker ending snapshot is supplied and reconciled.
 
 This raw-price actual-account path prevents the broker's cash dividend from being counted again through a dividend-adjusted market-price series.
 
@@ -74,7 +91,7 @@ All passive benchmarks receive the same external contributions and withdrawals o
 
 ## Strategy reset analysis
 
-The full Firstrade transaction history is always reconstructed first. The main active-versus-passive research comparison is then reset at the `analysis_start_date` in `config/config.yaml`, currently `2026-04-01`.
+The full Firstrade transaction history is always reconstructed first. The legacy inventory-preserving comparison is then reset at the `analysis_start_date` in `config/config.yaml`, currently `2026-04-01`. This output remains for backward compatibility, but it is not the current primary research question because it includes positions established before the start date.
 
 At the 2026-04-01 close, the pipeline preserves every reconstructed security quantity and the real account cash balance. The full-account strategy-start NAV is:
 
@@ -163,7 +180,7 @@ figures/     equity, drawdown and rolling-risk charts
 metadata/    run info, data sources and warnings
 ```
 
-Reset-specific outputs include `summary/opening_state_20260401.csv`, `summary/opening_cash_20260401.csv`, `summary/performance_since_start.csv`, `benchmarks/active_sleeve_cashflows.csv`, `benchmarks/decision_matched_transactions.csv`, `risk/active_sleeve_contribution_since_start.csv`, and `risk/regime_analysis_since_start.csv`.
+Primary new-money outputs include `summary/new_money_cohort_performance.csv`, `trades/new_money_cohort_trade_audit.csv`, `trades/cohort_dividend_audit.csv`, and `benchmarks/decision_matched_transactions.csv`. Legacy reset-specific outputs include `summary/opening_state_20260401.csv`, `summary/opening_cash_20260401.csv`, `summary/performance_since_start.csv`, `benchmarks/active_sleeve_cashflows.csv`, `benchmarks/decision_matched_transactions_strategy_reset.csv`, `risk/active_sleeve_contribution_since_start.csv`, and `risk/regime_analysis_since_start.csv`.
 
 `run_info.json` records `price_source = Tiingo`, Tiingo's API latest date, coverage status, input hash, analysis dates, assumptions, portfolio definitions, benchmark weights, software versions, git SHA, and all warnings.
 
@@ -182,6 +199,6 @@ outputs/      ignored generated artifacts
 
 ## Reconciliation and limitations
 
-The pipeline checks its internal daily accounting identity. True broker reconciliation additionally needs the latest Firstrade holdings and ending account value; absent inputs are explicitly marked `NOT_PROVIDED`, never treated as matched. Differences above `$1` or `0.01%` must be investigated.
+The pipeline checks its internal daily accounting identity. This is not full broker reconciliation. True broker reconciliation additionally needs the latest Firstrade holdings, cash, market value, and ending account value; absent inputs are explicitly marked `NOT_PROVIDED`, never treated as matched. Until a broker ending snapshot is provided and matched, timing-sensitivity performance is marked `INVALID_ACCOUNTING_INPUT`. Differences above `$1` or `0.01%` must be investigated.
 
 Interpretation must acknowledge the short 2026 YTD period, limited regime coverage, non-random portfolio formation, contribution timing, missing intraday timestamps, incomplete fee/tax fields, differing universes, vendor adjustment conventions, and the inability of short-period results to establish durable alpha.

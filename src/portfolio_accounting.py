@@ -20,7 +20,10 @@ def time_weighted_returns(nav: pd.Series, external_cash_flow: pd.Series) -> pd.S
     flow = external_cash_flow.reindex(nav.index, fill_value=0).astype(float)
     previous = nav.shift(1)
     result = (nav - flow) / previous - 1
-    result.iloc[0] = np.nan if abs(nav.iloc[0] - flow.iloc[0]) < 1e-12 else (nav.iloc[0] - flow.iloc[0]) / abs(flow.iloc[0])
+    seed = previous.fillna(0.0).abs().lt(1e-12) & flow.gt(0)
+    result.loc[seed] = (nav.loc[seed] - flow.loc[seed]) / flow.loc[seed]
+    idle = previous.fillna(0.0).abs().lt(1e-12) & flow.abs().lt(1e-12)
+    result.loc[idle] = np.nan
     return result.replace([np.inf, -np.inf], np.nan)
 
 
@@ -43,7 +46,10 @@ def reconstruct_portfolio(
     tx = transactions.copy()
     if included_tickers is not None:
         security = tx["ticker"].isin(included_tickers)
-        cash_only = tx["type"].isin(["deposit", "withdrawal", "interest", "withholding_tax", "fee"])
+        cash_only = tx["type"].isin([
+            "deposit", "withdrawal", "interest", "withholding_tax", "fee",
+            "margin_interest_expense", "internal_transfer", "non_investment_credit",
+        ])
         tx = tx[security | cash_only].copy()
     if tx.empty:
         raise ValueError("No transactions remain for portfolio reconstruction")
@@ -65,20 +71,40 @@ def reconstruct_portfolio(
     for date in dates:
         today_prices = prices.loc[date]
         day_tx = tx[tx["date"].eq(date)]
+        comparable_previous = previous_prices.copy() if previous_prices is not None else None
+        split_value_adjustment = 0.0
+        for idx, row in day_tx.loc[day_tx["type"].eq("split")].iterrows():
+            ticker = str(row["ticker"])
+            issued = float(row["quantity"])
+            if abs(float(row.get("price", 0.0) or 0.0)) > 1e-12 or abs(float(row.get("amount", 0.0) or 0.0)) > 1e-12:
+                raise ValueError(f"Split row {idx} has non-zero price or amount")
+            before = positions.get(ticker, 0.0)
+            if before <= 0 or issued <= 0:
+                raise ValueError(f"Cannot apply split for {ticker} on {date.date()}: before={before}, issued={issued}")
+            ratio = (before + issued) / before
+            positions[ticker] = before + issued
+            if comparable_previous is not None:
+                comparable_previous.loc[ticker] = float(previous_prices[ticker]) / ratio
+            ledger_rows.append({
+                "row": idx, "date": date, "type": "split", "ticker": ticker,
+                "quantity": issued, "cash_delta": 0.0, "shares_after": positions[ticker],
+                "split_ratio": ratio,
+            })
         required_today = {
             str(t) for t, qty in positions.items() if abs(qty) > 1e-12
-        } | set(day_tx.loc[day_tx["type"].isin(["buy", "sell"]), "ticker"].dropna().astype(str))
+        } | set(day_tx.loc[day_tx["type"].isin(["buy", "sell", "split"]), "ticker"].dropna().astype(str))
         missing_today = sorted(
             ticker for ticker in required_today
             if ticker not in prices.columns or pd.isna(today_prices.get(ticker)) or float(today_prices[ticker]) <= 0
         )
         if missing_today:
             raise ValueError(f"Missing held/traded market price on {date.date()}: {missing_today}")
-        existing_pnl = 0.0 if previous_prices is None else sum(
-            qty * (float(today_prices[t]) - float(previous_prices[t]))
-            for t, qty in positions.items() if qty and pd.notna(today_prices.get(t)) and pd.notna(previous_prices.get(t))
+        existing_pnl = 0.0 if comparable_previous is None else sum(
+            qty * (float(today_prices[t]) - float(comparable_previous[t]))
+            for t, qty in positions.items() if qty and pd.notna(today_prices.get(t)) and pd.notna(comparable_previous.get(t))
         )
         buy_pnl = sell_pnl = dividends = interest_income = taxes = fees = external_flow = 0.0
+        margin_interest = non_investment_credit = 0.0
         for idx, row in day_tx.iterrows():
             kind = row["type"]
             if kind in {"deposit", "withdrawal"}:
@@ -97,6 +123,20 @@ def reconstruct_portfolio(
                 value = abs(float(row["cash_flow"]))
                 cash += value; interest_income += value
                 ledger_rows.append({"row": idx, "date": date, "type": kind, "cash_delta": value})
+                continue
+            if kind == "margin_interest_expense":
+                value = abs(float(row["cash_flow"] or row.get("amount", 0.0) or 0.0))
+                cash -= value; margin_interest += value
+                ledger_rows.append({"row": idx, "date": date, "type": kind, "cash_delta": -value})
+                continue
+            if kind == "non_investment_credit":
+                value = abs(float(row["cash_flow"] or row.get("amount", 0.0) or 0.0))
+                cash += value; external_flow += value; non_investment_credit += value
+                ledger_rows.append({"row": idx, "date": date, "type": kind, "cash_delta": value, "external_cash_flow": value})
+                continue
+            if kind in {"internal_transfer", "corporate_action", "split"}:
+                if kind != "split":
+                    ledger_rows.append({"row": idx, "date": date, "type": kind, "cash_delta": 0.0})
                 continue
             if kind == "withholding_tax":
                 if pd.isna(row["cash_flow"]):
@@ -120,7 +160,7 @@ def reconstruct_portfolio(
             quantity = float(row["quantity"])
             fee = float(row.get("fee", 0) or 0)
             close = float(today_prices[ticker])
-            previous = close if previous_prices is None or pd.isna(previous_prices.get(ticker)) else float(previous_prices[ticker])
+            previous = close if comparable_previous is None or pd.isna(comparable_previous.get(ticker)) else float(comparable_previous[ticker])
             before = positions.get(ticker, 0.0)
             if kind == "buy":
                 positions[ticker] = before + quantity
@@ -146,8 +186,12 @@ def reconstruct_portfolio(
         daily_rows.append({"date": date, "cash": cash, "market_value": market_value, "nav": nav,
                            "external_cash_flow": external_flow, "existing_position_market_pnl": existing_pnl,
                            "buy_execution_to_close_pnl": buy_pnl, "sell_previous_close_to_execution_pnl": sell_pnl,
-                           "dividend_income": dividends, "interest_income": interest_income, "withholding_tax": taxes, "fees": fees,
-                           "investment_pnl": existing_pnl + buy_pnl + sell_pnl + dividends + interest_income - taxes - fees})
+                           "dividend_income": dividends, "interest_income": interest_income,
+                           "margin_interest_expense": margin_interest,
+                           "non_investment_credit": non_investment_credit,
+                           "split_value_adjustment": split_value_adjustment,
+                           "withholding_tax": taxes, "fees": fees,
+                           "investment_pnl": existing_pnl + buy_pnl + sell_pnl + dividends + interest_income - taxes - fees - margin_interest})
         holding_rows.extend({"date": date, "ticker": ticker, "shares": qty, "price": float(today_prices[ticker]),
                              "market_value": qty * float(today_prices[ticker])}
                             for ticker, qty in positions.items() if abs(qty) > 1e-12)
