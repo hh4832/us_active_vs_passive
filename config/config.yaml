@@ -1,0 +1,35 @@
+risk_free_rate: 0.04
+annualization_factor: 252
+transaction_timing: actual_fill
+cash_flow_timing: end_of_day_available
+realized_pnl_method: FIFO
+reconciliation_tolerance_usd: 1.0
+reconciliation_tolerance_pct: 0.0001
+google_drive_folder_id: 1NlsfPTDpI1hDRso6NwERT7xYvlLOe1g2
+portfolio_definitions:
+  active_equity_sleeve:
+    exclude: [VOO, VGT, SGOV]
+    include_cash: true
+  active_plus_sgov:
+    exclude: [VOO, VGT]
+    include_cash: true
+  full_actual_account:
+    exclude: []
+    include_cash: true
+benchmarks:
+  voo: {VOO: 1.0}
+  vgt: {VGT: 1.0}
+  voo_sgov_80_20: {VOO: 0.8, SGOV: 0.2}
+  vgt_sgov_80_20: {VGT: 0.8, SGOV: 0.2}
+known_funds: [GLD, VOO, VGT, SGOV]
+column_aliases:
+  date: [date, trade_date, transaction_date, 日期, 交易日期]
+  type: [type, action, transaction_type, activity, 交易類別, 類別]
+  ticker: [symbol, ticker, security, 股票代號, 代號]
+  quantity: [quantity, qty, shares, 數量, 股數]
+  price: [price, execution_price, 成交價格, 價格]
+  amount: [amount, net_amount, 金額, 淨額]
+  dividend: [dividend, dividend_amount, 股息]
+  cash_flow: [cash_flow, deposit_withdrawal, 入金出金, 入金 / 出金]
+  fee: [fee, fees, commission, 手續費, 費用]
+
