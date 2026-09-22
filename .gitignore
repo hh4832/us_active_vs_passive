@@ -1,0 +1,17 @@
+.env
+*.pfx
+credentials*.json
+service_account.json
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+outputs/*
+!outputs/.gitkeep
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.ipynb_checkpoints/
+.venv/
+
