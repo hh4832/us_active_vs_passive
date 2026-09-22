@@ -1,5 +1,6 @@
 risk_free_rate: 0.04
 annualization_factor: 252
+analysis_start_date: "2026-04-01"
 transaction_timing: actual_fill
 cash_flow_timing: end_of_day_available
 realized_pnl_method: FIFO

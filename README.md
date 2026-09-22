@@ -72,6 +72,22 @@ NAV is for account reconciliation; TWR removes external deposits and withdrawals
 
 All passive benchmarks receive the same external contributions and withdrawals on the same dates as the actual account and permit fractional shares.
 
+## Strategy reset analysis
+
+The full Firstrade transaction history is always reconstructed first. The main active-versus-passive research comparison is then reset at the `analysis_start_date` in `config/config.yaml`, currently `2026-04-01`.
+
+At the 2026-04-01 close, the pipeline preserves every reconstructed security quantity and the real account cash balance. The full-account strategy-start NAV is:
+
+```text
+opening cash + sum(opening shares × Tiingo raw close on 2026-04-01)
+```
+
+The reset index is exactly `1.0` on that date. Historical holdings are preserved, but all pre-start profit and loss is excluded. Post-start deposits and withdrawals remain external flows, so they do not inflate or depress TWR.
+
+The active sleeve is defined from the configured portfolio exclusions rather than a hard-coded ticker list. Its opening inventory is marked at the 2026-04-01 raw close. Subsequent active buys are recorded as sleeve contributions; active sells and broker dividends transferred back to account cash are recorded as withdrawals. Cash-flow-matched VOO, VGT, and 80/20 equity/SGOV portfolios receive those same dated amounts. Decision-matched VOO and VGT additionally test the contribution-only counterfactual of directing each active buy's actual dollar amount to the benchmark on the same date.
+
+This is why the research cannot use Firstrade `Total Gain` directly: that field can contain pre-reset cost basis and historical P&L, does not isolate active-sleeve capital transfers, and cannot enforce identical benchmark funding dates. Each run therefore writes opening-state audits, dated sleeve cash flows, reset performance, attribution, regime analysis, and reset-specific figures while retaining every full-history output.
+
 ### Metrics and formulas
 
 - Cumulative return: `product(1 + r_t) - 1`
@@ -146,6 +162,8 @@ benchmarks/  cash-flow-matched benchmark series
 figures/     equity, drawdown and rolling-risk charts
 metadata/    run info, data sources and warnings
 ```
+
+Reset-specific outputs include `summary/opening_state_20260401.csv`, `summary/opening_cash_20260401.csv`, `summary/performance_since_start.csv`, `benchmarks/active_sleeve_cashflows.csv`, `benchmarks/decision_matched_transactions.csv`, `risk/active_sleeve_contribution_since_start.csv`, and `risk/regime_analysis_since_start.csv`.
 
 `run_info.json` records `price_source = Tiingo`, Tiingo's API latest date, coverage status, input hash, analysis dates, assumptions, portfolio definitions, benchmark weights, software versions, git SHA, and all warnings.
 

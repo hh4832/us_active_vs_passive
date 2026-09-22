@@ -47,3 +47,67 @@ def create_account_figures(daily: pd.DataFrame, holdings: pd.DataFrame, ticker_s
     if not ticker_summary.empty:
         ordered = ticker_summary.sort_values("total_pnl")
         fig, ax = plt.subplots(figsize=(10, 6)); ax.barh(ordered.ticker, ordered.total_pnl); ax.axvline(0, color="gray", linewidth=.8); ax.set(title="Ticker contribution to total P&L", xlabel="P&L", ylabel="Ticker"); _save(fig, output / "contribution.png", note)
+
+
+def create_since_start_figures(
+    returns: pd.DataFrame,
+    output_dir: str | Path,
+    *,
+    start_date: str,
+    note: str = "Strategy reset; actual sleeves use Tiingo raw close and broker dividends; benchmarks use Tiingo adjClose",
+) -> None:
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+
+    def wealth(columns: list[str]) -> pd.DataFrame:
+        available = [column for column in columns if column in returns]
+        return (1.0 + returns[available].fillna(0.0)).cumprod()
+
+    core = [
+        "full_account_since_start", "active_sleeve_since_start",
+        "full_account_matched_voo", "full_account_matched_vgt",
+        "cf_matched_voo", "cf_matched_vgt",
+    ]
+    fig, ax = plt.subplots(figsize=(11, 6))
+    wealth(core).plot(ax=ax)
+    ax.set(title=f"Strategy-reset equity curves since {start_date}", ylabel="Growth of $1", xlabel="Date")
+    _save(fig, output / "equity_curve_since_20260401.png", note)
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+    returns[[c for c in core if c in returns]].apply(drawdown_series).plot(ax=ax)
+    ax.set(title=f"Strategy-reset drawdowns since {start_date}", ylabel="Drawdown", xlabel="Date")
+    _save(fig, output / "drawdown_since_20260401.png", note)
+
+    for benchmark, filename, label in [
+        ("cf_matched_voo", "active_vs_cf_matched_voo.png", "VOO"),
+        ("cf_matched_vgt", "active_vs_cf_matched_vgt.png", "VGT"),
+    ]:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        wealth(["active_sleeve_since_start", benchmark]).plot(ax=ax)
+        ax.set(title=f"Active sleeve vs cash-flow-matched {label}", ylabel="Growth of $1", xlabel="Date")
+        _save(fig, output / filename, note)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    wealth(["active_sleeve_since_start", "decision_matched_voo", "decision_matched_vgt"]).plot(ax=ax)
+    ax.set(title="Active decisions vs contribution-only passive counterfactuals", ylabel="Growth of $1", xlabel="Date")
+    _save(fig, output / "decision_matched_comparison.png", note)
+
+    rolling_columns = [
+        "active_sleeve_since_start", "cf_matched_voo", "cf_matched_vgt",
+        "beta_matched_voo_sgov", "volatility_matched_voo_sgov",
+    ]
+    fig, ax = plt.subplots(figsize=(10, 5))
+    (returns[[c for c in rolling_columns if c in returns]].rolling(20).std() * 252 ** 0.5).plot(ax=ax)
+    ax.set(title="Rolling 20-day annualized volatility since strategy reset", ylabel="Volatility", xlabel="Date")
+    _save(fig, output / "rolling_volatility_since_start.png", note)
+
+    if "active_sleeve_since_start" in returns and "voo_total_return_since_start" in returns:
+        active = returns["active_sleeve_since_start"]
+        voo = returns["voo_total_return_since_start"]
+        rolling_beta = active.rolling(60).cov(voo) / voo.rolling(60).var()
+        fig, ax = plt.subplots(figsize=(10, 5))
+        rolling_beta.plot(ax=ax, label="Active beta vs VOO")
+        ax.axhline(1.0, color="gray", linestyle="--")
+        ax.set(title="Rolling 60-day beta since strategy reset", ylabel="Beta", xlabel="Date")
+        ax.legend()
+        _save(fig, output / "rolling_beta_since_start.png", note)

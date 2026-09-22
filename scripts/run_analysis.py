@@ -21,10 +21,17 @@ from src.export import base_run_info, create_run_directory, write_json
 from src.load_transactions import load_transactions
 from src.normalize_transactions import audit_transactions, normalize_transactions
 from src.performance import performance_metrics, relative_metrics
-from src.plotting import create_account_figures, create_standard_figures
+from src.plotting import create_account_figures, create_since_start_figures, create_standard_figures
 from src.portfolio_accounting import reconstruct_next_day_sensitivity, reconstruct_portfolio
 from src.price_adjustment import attach_adjusted_execution_prices
 from src.regime import capture_ratios, regime_analysis
+from src.strategy_reset import (
+    active_sleeve_attribution,
+    build_active_sleeve_since_start,
+    build_reset_portfolio,
+    decision_matched_cashflows,
+    opening_state_audits,
+)
 from src.tiingo_loader import audit_tiingo_coverage, load_tiingo_prices
 
 
@@ -53,6 +60,16 @@ def main() -> int:
     audit.unrecognized_types.to_csv(run / "trades/unrecognized_transaction_types.csv", index=False)
     tx.to_csv(run / "trades/normalized_transactions_pre_price.csv", index=False)
     write_json(run / "metadata/warnings.json", audit.warnings)
+
+    strategy_start = pd.Timestamp(cfg["analysis_start_date"]).normalize()
+    if not audit.negative_holdings.empty:
+        negative_dates = pd.to_datetime(audit.negative_holdings["date"])
+        pre_start_negative = audit.negative_holdings.loc[negative_dates.le(strategy_start)]
+        if not pre_start_negative.empty:
+            raise RuntimeError(
+                "Negative holdings exist on or before the strategy reset date; "
+                "opening inventory cannot be inferred. See trades/negative_holdings_diagnostic.csv"
+            )
 
     universe = sorted(tx.loc[tx.type.isin(["buy", "sell"]), "ticker"].dropna().unique())
     required = sorted(set(universe) | {"VOO", "VGT", "SGOV"})
@@ -106,6 +123,130 @@ def main() -> int:
     actual.daily[["twr"]].to_csv(run / "daily/daily_returns.csv")
     actual.daily[["cash", "market_value"]].to_csv(run / "daily/daily_exposure.csv")
     drawdown_series(actual.daily.twr).rename("drawdown").to_csv(run / "daily/daily_drawdown.csv")
+
+    # Strategy-reset analysis uses the complete history to establish the 2026-04-01
+    # account state, then discards all earlier P&L from the comparison period.
+    full_reset = build_reset_portfolio(actual, strategy_start)
+    reset_definition = definitions.get("active_risk_assets", definitions["active_equity_sleeve"])
+    reset_active_tickers = set(universe) - set(reset_definition.get("exclude", []))
+    active_reset = build_active_sleeve_since_start(
+        tx, bundle.close, actual, strategy_start, reset_active_tickers,
+        execution_price_column="raw_execution_price",
+    )
+    if float(full_reset.daily.iloc[0]["nav"]) <= 0:
+        raise RuntimeError("Strategy-start full-account NAV must be positive")
+    if float(active_reset.daily.iloc[0]["nav"]) <= 0:
+        raise RuntimeError("Strategy-start active-sleeve opening capital must be positive")
+    full_reset.daily.to_csv(run / "daily/full_account_since_start_daily_nav.csv")
+    full_reset.holdings.to_csv(run / "daily/full_account_since_start_daily_holdings.csv", index=False)
+    active_reset.daily.to_csv(run / "daily/active_sleeve_since_start_daily_nav.csv")
+    active_reset.holdings.to_csv(run / "daily/active_sleeve_since_start_daily_holdings.csv", index=False)
+    active_reset.cashflows.to_csv(run / "benchmarks/active_sleeve_cashflows.csv", index=False)
+
+    opening_state, opening_cash = opening_state_audits(
+        actual, bundle.close, strategy_start, reset_active_tickers, set(cfg.get("known_funds", [])),
+    )
+    opening_state.to_csv(run / "summary/opening_state_20260401.csv", index=False)
+    opening_cash.to_csv(run / "summary/opening_cash_20260401.csv", index=False)
+
+    since_index = full_reset.daily.index
+    since_prices = bundle.adj_close.reindex(since_index)
+    full_reset_flows = full_reset.daily["external_cash_flow"].copy()
+    full_reset_flows.iloc[0] = float(full_reset.daily.iloc[0]["nav"])
+    active_reset_flows = active_reset.daily["external_cash_flow"].copy()
+    since_benchmarks = {
+        "full_account_matched_voo": cashflow_matched_benchmark(full_reset_flows, since_prices, {"VOO": 1.0}),
+        "full_account_matched_vgt": cashflow_matched_benchmark(full_reset_flows, since_prices, {"VGT": 1.0}),
+        "cf_matched_voo": cashflow_matched_benchmark(active_reset_flows, since_prices, {"VOO": 1.0}),
+        "cf_matched_vgt": cashflow_matched_benchmark(active_reset_flows, since_prices, {"VGT": 1.0}),
+        "cf_matched_voo_sgov_80_20": cashflow_matched_benchmark(
+            active_reset_flows, since_prices, {"VOO": 0.8, "SGOV": 0.2},
+        ),
+        "cf_matched_vgt_sgov_80_20": cashflow_matched_benchmark(
+            active_reset_flows, since_prices, {"VGT": 0.8, "SGOV": 0.2},
+        ),
+    }
+    # Explicit aliases match the research-output terminology in the protocol.
+    since_benchmarks["voo_sgov_80_20_since_start"] = since_benchmarks["cf_matched_voo_sgov_80_20"]
+    since_benchmarks["vgt_sgov_80_20_since_start"] = since_benchmarks["cf_matched_vgt_sgov_80_20"]
+
+    voo_since = since_prices["VOO"].pct_change(fill_method=None)
+    vgt_since = since_prices["VGT"].pct_change(fill_method=None)
+    sgov_since = since_prices["SGOV"].pct_change(fill_method=None)
+    active_since = active_reset.daily["twr"]
+    since_beta = relative_metrics(active_since, voo_since)["beta"]
+    since_dynamic = {
+        "beta_matched_voo_sgov": beta_matched_weights(since_beta),
+        "volatility_matched_voo_sgov": volatility_matched_weights(active_since, voo_since, sgov_since),
+    }
+    for name, weights in since_dynamic.items():
+        since_benchmarks[name] = cashflow_matched_benchmark(active_reset_flows, since_prices, weights)
+
+    opening_active_capital = float(active_reset.daily.iloc[0]["nav"])
+    decision_flows, decision_base = decision_matched_cashflows(
+        tx, since_index, strategy_start, reset_active_tickers, opening_active_capital,
+        execution_price_column="raw_execution_price",
+    )
+    decision_rows = []
+    for benchmark in ["VOO", "VGT"]:
+        key = f"decision_matched_{benchmark.lower()}"
+        since_benchmarks[key] = cashflow_matched_benchmark(decision_flows, since_prices, {benchmark: 1.0})
+        for row in decision_base.itertuples(index=False):
+            price = float(since_prices.loc[row.date, benchmark])
+            decision_rows.append({
+                "date": row.date, "active_ticker": row.active_ticker,
+                "active_amount": row.active_amount, "benchmark": benchmark,
+                "benchmark_price": price, "benchmark_shares": row.active_amount / price,
+                "source_row": row.source_row,
+            })
+    pd.DataFrame(decision_rows).to_csv(run / "benchmarks/decision_matched_transactions.csv", index=False)
+
+    pd.concat({name: frame["nav"] for name, frame in since_benchmarks.items()}, axis=1).to_csv(
+        run / "benchmarks/cashflow_matched_since_start.csv"
+    )
+    since_returns = pd.concat(
+        {
+            "full_account_since_start": full_reset.daily["twr"],
+            "active_sleeve_since_start": active_since,
+            **{name: frame["return"] for name, frame in since_benchmarks.items()},
+            "voo_total_return_since_start": voo_since,
+            "vgt_total_return_since_start": vgt_since,
+        },
+        axis=1,
+    )
+    since_returns.to_csv(run / "benchmarks/benchmark_returns_since_start.csv")
+
+    since_summary_rows = []
+    for name in since_returns.columns:
+        metrics = performance_metrics(
+            since_returns[name], risk_free_rate=float(cfg["risk_free_rate"]),
+            annualization=int(cfg["annualization_factor"]),
+        )
+        relative = relative_metrics(since_returns[name], voo_since)
+        captures = capture_ratios(since_returns[name], voo_since).set_index("regime")
+        since_summary_rows.append({
+            "portfolio": name, **metrics,
+            "beta_vs_voo": relative["beta"], "alpha_vs_voo": relative["alpha"],
+            "upside_capture": captures.loc["up", "arithmetic_daily_capture"],
+            "downside_capture": captures.loc["down", "arithmetic_daily_capture"],
+            "tracking_error": relative["tracking_error"],
+            "information_ratio": relative["information_ratio"],
+        })
+    since_summary = pd.DataFrame(since_summary_rows)
+    since_summary.to_csv(run / "summary/performance_since_start.csv", index=False)
+    (run / "summary/performance_since_start.md").write_text(
+        since_summary.to_markdown(index=False), encoding="utf-8"
+    )
+    regime_analysis(active_since, voo_since).to_csv(
+        run / "risk/regime_analysis_since_start.csv", index=False,
+    )
+    active_sleeve_attribution(
+        tx, active_reset, strategy_start, reset_active_tickers,
+        execution_price_column="raw_execution_price",
+    ).to_csv(run / "risk/active_sleeve_contribution_since_start.csv", index=False)
+    create_since_start_figures(
+        since_returns, run / "figures", start_date=strategy_start.date().isoformat(),
+    )
 
     flows = actual.daily.external_cash_flow
     benchmark_frames = {}
@@ -173,11 +314,21 @@ def main() -> int:
     }
     info = base_run_info(args.transactions, analysis_start=actual.daily.index.min(), analysis_end=actual.daily.index.max(),
                          price_source="Tiingo", api_latest_date=bundle.latest_date,
+                         strategy_start_date=strategy_start,
+                         strategy_start_nav=float(full_reset.daily.iloc[0]["nav"]),
+                         active_sleeve_opening_capital=opening_active_capital,
+                         strategy_reset_policy={
+                             "valuation_point": "2026-04-01 end-of-day raw close after recorded same-day transactions",
+                             "pre_start_pnl_included": False,
+                             "opening_inventory_preserved": True,
+                             "active_trade_cash_legs_are_external_flows": True,
+                             "decision_matched_primary": "contribution-only",
+                         },
                          coverage_status=coverage_status, tickers=required,
                          detected_columns=detected, risk_free_rate=cfg["risk_free_rate"], annualization_factor=cfg["annualization_factor"],
                          transaction_timing_convention=cfg["transaction_timing"], cash_flow_timing=cfg["cash_flow_timing"],
                          realized_pnl_method=cfg["realized_pnl_method"], portfolio_definitions=definitions,
-                         benchmark_definitions=cfg["benchmarks"] | dynamic,
+                         benchmark_definitions=cfg["benchmarks"] | dynamic | since_dynamic,
                          actual_account_price_methodology="raw Tiingo close plus actual Firstrade cash dividends",
                          benchmark_price_methodology="Tiingo adjClose total-return series",
                          adjustment_methodology="adjusted_execution_price = actual Firstrade fill * Tiingo adjClose/close",
