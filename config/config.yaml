@@ -7,11 +7,16 @@ reconciliation_tolerance_usd: 1.0
 reconciliation_tolerance_pct: 0.0001
 google_drive_folder_id: 1NlsfPTDpI1hDRso6NwERT7xYvlLOe1g2
 portfolio_definitions:
-  active_equity_sleeve:
-    exclude: [VOO, VGT, SGOV]
+  active_risk_assets:
+    exclude: [VOO, VGT, SGOV, SYSB]
     include_cash: true
+  active_equity_sleeve:
+    exclude: [VOO, VGT, SGOV, SYSB]
+    include_cash: true
+  # This sleeve intentionally contains SGOV but excludes SYSB, which is a
+  # separate fixed-income ETF rather than active stock-selection exposure.
   active_plus_sgov:
-    exclude: [VOO, VGT]
+    exclude: [VOO, VGT, SYSB]
     include_cash: true
   full_actual_account:
     exclude: []
@@ -21,7 +26,7 @@ benchmarks:
   vgt: {VGT: 1.0}
   voo_sgov_80_20: {VOO: 0.8, SGOV: 0.2}
   vgt_sgov_80_20: {VGT: 0.8, SGOV: 0.2}
-known_funds: [GLD, VOO, VGT, SGOV]
+known_funds: [GLD, VOO, VGT, SGOV, SYSB]
 column_aliases:
   date: [date, trade_date, transaction_date, 日期, 交易日期]
   type: [type, action, transaction_type, activity, 交易類別, 類別]
@@ -32,4 +37,3 @@ column_aliases:
   dividend: [dividend, dividend_amount, 股息]
   cash_flow: [cash_flow, deposit_withdrawal, 入金出金, 入金 / 出金]
   fee: [fee, fees, commission, 手續費, 費用]
-

@@ -12,6 +12,19 @@ The repository contains the complete analysis framework and synthetic unit tests
 
 The pipeline never silently fixes transaction anomalies. Phase A audit files are written before FinLab retrieval or performance analysis. Missing fields, unsupported activity types, negative positions, unavailable tickers, missing adjustment factors, and unresolved reconciliation items are preserved in the warnings output.
 
+### Audited external price fallback
+
+FinLab remains the primary price source. If a real holding is absent from both FinLab US stock and fund datasets, an optional `data/fallback_prices.csv` may provide an externally reviewed series:
+
+```csv
+date,ticker,close,adj_close,source,no_corporate_action_confirmed
+2026-01-05,EXAMPLE,100.00,99.50,external_manual,
+```
+
+The first five columns are required. `adj_close` may be blank only when `no_corporate_action_confirmed` is explicitly set to `true` after confirming that no split or corporate action occurred; the pipeline then uses a factor of 1.0 and records a warning. The repository does not download, invent, or silently forward-fill missing execution-date inputs. External data should not be committed unless its provenance and redistribution status are appropriate.
+
+Every run writes `trades/price_resolution_audit.csv`, `trades/negative_holdings_diagnostic.csv`, and transaction-type diagnostic tables before performance reconstruction. Unresolved execution prices remain fatal.
+
 ## Methodology
 
 ### Actual-fill reconstruction
@@ -50,8 +63,9 @@ NAV is for account reconciliation; TWR removes external deposits and withdrawals
 
 | Portfolio | Holdings |
 |---|---|
-| Active Equity Sleeve | Active stocks + GLD; excludes VOO, VGT, SGOV |
-| Active + SGOV | Active stocks + GLD + SGOV; excludes VOO, VGT |
+| Active Risk Assets | Active stocks + GLD; excludes VOO, VGT, SGOV, SYSB |
+| Active Equity Sleeve | Compatibility alias for Active Risk Assets; SYSB is excluded |
+| Active + SGOV | Active stocks + GLD + SGOV; excludes VOO, VGT, SYSB |
 | Full Actual Account | All actual securities and cash |
 | Passive variants | VOO, VGT, 80/20 VOO/SGOV, 80/20 VGT/SGOV |
 | Matched variants | Beta-matched and volatility-matched VOO/SGOV |
@@ -101,7 +115,7 @@ The production notebook is `notebooks/us_active_vs_passive_colab.ipynb`. Before 
 
 The configured Drive folder ID identifies the intended folder, but it is not a Linux filesystem path. After mounting Drive in Colab, set `DRIVE_OUTPUT_ROOT` to that folder's real path under `/content/drive/MyDrive/`. If the folder name or location differs, only this parameter needs to change.
 
-Run the notebook from top to bottom. It clones the latest `main`, installs dependencies, authenticates FinLab, accepts the Firstrade export, requires all 13 unit tests to pass, runs the production pipeline, displays the main results, and copies the timestamped run folder to Drive.
+Run the notebook from top to bottom. It clones the latest `main`, installs dependencies, authenticates FinLab, accepts the Firstrade export, requires the complete unit-test suite to pass, runs the production pipeline, displays the main results, and copies the timestamped run folder to Drive.
 
 The notebook is an execution and review interface, not the source of the analysis logic. Production accounting, benchmarking, attribution, and reporting remain in `src/` and `scripts/run_analysis.py`.
 

@@ -40,7 +40,8 @@ def reconstruct_portfolio(
     tx = transactions.copy()
     if included_tickers is not None:
         security = tx["ticker"].isin(included_tickers)
-        tx = tx[security | tx["type"].isin(["deposit", "withdrawal"])].copy()
+        cash_only = tx["type"].isin(["deposit", "withdrawal", "interest", "withholding_tax", "fee"])
+        tx = tx[security | cash_only].copy()
     if tx.empty:
         raise ValueError("No transactions remain for portfolio reconstruction")
     prices = adj_close.sort_index().copy().ffill()
@@ -63,7 +64,7 @@ def reconstruct_portfolio(
             qty * (float(today_prices[t]) - float(previous_prices[t]))
             for t, qty in positions.items() if qty and pd.notna(today_prices.get(t)) and pd.notna(previous_prices.get(t))
         )
-        buy_pnl = sell_pnl = dividends = fees = external_flow = 0.0
+        buy_pnl = sell_pnl = dividends = interest_income = taxes = fees = external_flow = 0.0
         for idx, row in day_tx.iterrows():
             kind = row["type"]
             if kind in {"deposit", "withdrawal"}:
@@ -75,6 +76,20 @@ def reconstruct_portfolio(
                 value = float(row["dividend"])
                 cash += value; dividends += value
                 ledger_rows.append({"row": idx, "date": date, "type": kind, "ticker": row["ticker"], "cash_delta": value})
+                continue
+            if kind == "interest":
+                if pd.isna(row["cash_flow"]):
+                    raise ValueError(f"Interest row {idx} has no auditable cash amount")
+                value = abs(float(row["cash_flow"]))
+                cash += value; interest_income += value
+                ledger_rows.append({"row": idx, "date": date, "type": kind, "cash_delta": value})
+                continue
+            if kind == "withholding_tax":
+                if pd.isna(row["cash_flow"]):
+                    raise ValueError(f"Withholding-tax row {idx} has no auditable cash amount")
+                value = abs(float(row["cash_flow"]))
+                cash -= value; taxes += value
+                ledger_rows.append({"row": idx, "date": date, "type": kind, "cash_delta": -value})
                 continue
             if kind == "fee":
                 value = float(row["fee"] or row["amount"] or 0)
@@ -117,8 +132,8 @@ def reconstruct_portfolio(
         daily_rows.append({"date": date, "cash": cash, "market_value": market_value, "nav": nav,
                            "external_cash_flow": external_flow, "existing_position_market_pnl": existing_pnl,
                            "buy_execution_to_close_pnl": buy_pnl, "sell_previous_close_to_execution_pnl": sell_pnl,
-                           "dividend_income": dividends, "fees": fees,
-                           "investment_pnl": existing_pnl + buy_pnl + sell_pnl + dividends - fees})
+                           "dividend_income": dividends, "interest_income": interest_income, "withholding_tax": taxes, "fees": fees,
+                           "investment_pnl": existing_pnl + buy_pnl + sell_pnl + dividends + interest_income - taxes - fees})
         holding_rows.extend({"date": date, "ticker": ticker, "shares": qty, "price": float(today_prices[ticker]),
                              "market_value": qty * float(today_prices[ticker])}
                             for ticker, qty in positions.items() if abs(qty) > 1e-12)
@@ -140,4 +155,3 @@ def reconstruct_next_day_sensitivity(transactions: pd.DataFrame, adj_close: pd.D
     shifted.loc[trade_mask, "date"] = shifted.loc[trade_mask, "date"].map(next_date)
     shifted.loc[trade_mask, "adjusted_execution_price"] = [adj_close.loc[d, t] for d, t in zip(shifted.loc[trade_mask, "date"], shifted.loc[trade_mask, "ticker"])]
     return reconstruct_portfolio(shifted, adj_close, **kwargs)
-

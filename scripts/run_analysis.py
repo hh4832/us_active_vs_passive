@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT))
 from src.attribution import fifo_realized_pnl, ticker_summary
 from src.benchmarks import beta_matched_weights, cashflow_matched_benchmark, volatility_matched_weights
 from src.drawdown import drawdown_episodes, drawdown_series
+from src.external_price_loader import empty_external_price_bundle, load_external_prices
 from src.export import base_run_info, create_run_directory, write_json
 from src.finlab_loader import load_finlab_prices
 from src.load_transactions import load_transactions
@@ -33,6 +34,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("transactions", type=Path, help="Firstrade CSV/XLSX")
     parser.add_argument("--config", type=Path, default=ROOT / "config/config.yaml")
     parser.add_argument("--outputs", type=Path, default=ROOT / "outputs")
+    parser.add_argument("--fallback-prices", type=Path, default=ROOT / "data/fallback_prices.csv",
+                        help="Optional audited external CSV for tickers absent from FinLab")
     parser.add_argument("--upload", action="store_true", help="Upload run folder using an existing rclone remote")
     parser.add_argument("--rclone-remote", default="gdrive")
     return parser.parse_args()
@@ -48,21 +51,50 @@ def main() -> int:
     run = create_run_directory(args.outputs)
     audit.summary.to_csv(run / "trades/transaction_audit.csv", index=False)
     audit.ticker_summary.to_csv(run / "trades/transaction_ticker_audit.csv", index=False)
+    audit.negative_holdings.to_csv(run / "trades/negative_holdings_diagnostic.csv", index=False)
+    audit.transaction_type_diagnostic.to_csv(run / "trades/transaction_type_diagnostic.csv", index=False)
+    audit.unrecognized_types.to_csv(run / "trades/unrecognized_transaction_types.csv", index=False)
     tx.to_csv(run / "trades/normalized_transactions_pre_price.csv", index=False)
     write_json(run / "metadata/warnings.json", audit.warnings)
 
     universe = sorted(tx.loc[tx.type.isin(["buy", "sell"]), "ticker"].dropna().unique())
     required = sorted(set(universe) | {"VOO", "VGT", "SGOV"})
     bundle = load_finlab_prices(required, cfg.get("known_funds", []))
-    tx, adjustment_warnings = attach_adjusted_execution_prices(tx, bundle.close, bundle.adj_close)
+    missing_finlab = set(required) - set(bundle.adj_close.columns)
+    external = (
+        load_external_prices(args.fallback_prices, required_tickers=missing_finlab)
+        if missing_finlab
+        else empty_external_price_bundle()
+    )
+    available_external = sorted(missing_finlab & set(external.adj_close.columns))
+    if available_external:
+        bundle.close = pd.concat([bundle.close, external.close[available_external]], axis=1).sort_index()
+        bundle.adj_close = pd.concat([bundle.adj_close, external.adj_close[available_external]], axis=1).sort_index()
+        bundle.classification.update({ticker: external.sources[ticker] for ticker in available_external})
+    tx, adjustment_warnings = attach_adjusted_execution_prices(
+        tx, bundle.close, bundle.adj_close, price_sources=bundle.classification,
+    )
+    price_audit_columns = [
+        "source_row", "date", "ticker", "type", "raw_execution_price", "close", "adj_close",
+        "adjustment_factor", "adjusted_execution_price", "adjustment_source",
+        "adjustment_reference_date", "adjustment_date_shift_days", "warning",
+    ]
+    tx.loc[tx.type.isin(["buy", "sell"]), price_audit_columns].to_csv(
+        run / "trades/price_resolution_audit.csv", index=False,
+    )
     fatal_trade_adjustments = tx.type.isin(["buy", "sell"]) & tx.adjusted_execution_price.isna()
-    warnings = audit.warnings + bundle.warnings + adjustment_warnings
+    warnings = audit.warnings + bundle.warnings + external.warnings + adjustment_warnings
     if fatal_trade_adjustments.any():
         write_json(run / "metadata/warnings.json", warnings)
-        raise RuntimeError(f"Cannot reconstruct {fatal_trade_adjustments.sum()} trade(s) without adjusted execution prices; audit saved to {run}")
+        unresolved = tx.loc[fatal_trade_adjustments, ["source_row", "date", "ticker", "type", "warning"]]
+        raise RuntimeError(
+            f"Cannot reconstruct {fatal_trade_adjustments.sum()} trade(s) without adjusted execution prices; "
+            f"audit saved to {run / 'trades/price_resolution_audit.csv'}; unresolved={unresolved.to_dict('records')}"
+        )
     tx.to_csv(run / "trades/normalized_transactions.csv", index=False)
 
     definitions = cfg["portfolio_definitions"]
+    active_included = set(universe) - set(definitions["active_equity_sleeve"].get("exclude", []))
     results = {}
     for name, definition in definitions.items():
         included = set(universe) - set(definition.get("exclude", []))
@@ -116,7 +148,7 @@ def main() -> int:
     tickers = ticker_summary(tx, bundle.adj_close.reindex(actual.daily.index).ffill().iloc[-1])
     tickers.to_csv(run / "trades/ticker_summary.csv", index=False)
 
-    sensitivity = reconstruct_next_day_sensitivity(tx, bundle.adj_close, included_tickers=set(universe) - {"VOO", "VGT", "SGOV"})
+    sensitivity = reconstruct_next_day_sensitivity(tx, bundle.adj_close, included_tickers=active_included)
     pd.DataFrame([{"convention": "actual_fill", **performance_metrics(active)},
                   {"convention": "next_day", **performance_metrics(sensitivity.daily.twr)}]).to_csv(run / "risk/timing_sensitivity.csv", index=False)
     create_standard_figures(returns[["active_equity_sleeve", "voo", "vgt", "voo_sgov_80_20", "beta_matched_voo_sgov"]], run / "figures")
@@ -130,14 +162,24 @@ def main() -> int:
     reconciliation.to_csv(run / "summary/account_reconciliation.csv", index=False)
     if (reconciliation.status == "WARNING").any(): warnings.append("Accounting reconciliation exceeded tolerance")
 
+    data_sources = ["us_price:close", "us_price:adj_close", "us_fund_price:close", "us_fund_price:adj_close"]
+    if available_external:
+        data_sources.append(str(args.fallback_prices))
     info = base_run_info(args.transactions, analysis_start=actual.daily.index.min(), analysis_end=actual.daily.index.max(),
-                         finlab_data_sources=["us_price:close", "us_price:adj_close", "us_fund_price:close", "us_fund_price:adj_close"],
+                         finlab_data_sources=data_sources,
                          finlab_latest_date=bundle.adj_close.index.max(), tickers=required, stock_fund_classification=bundle.classification,
                          detected_columns=detected, risk_free_rate=cfg["risk_free_rate"], annualization_factor=cfg["annualization_factor"],
                          transaction_timing_convention=cfg["transaction_timing"], cash_flow_timing=cfg["cash_flow_timing"],
                          realized_pnl_method=cfg["realized_pnl_method"], portfolio_definitions=definitions,
                          benchmark_definitions=cfg["benchmarks"] | dynamic,
-                         adjustment_methodology="adjusted_execution_price = raw execution price * adj_close / close", warnings=warnings)
+                         adjustment_methodology="adjusted_execution_price = raw execution price * resolved adj_close/close factor",
+                         price_resolution_policy={
+                             "primary": "exact FinLab factor",
+                             "neighbor_window_calendar_days": 3,
+                             "neighbor_factor_tolerance": 1e-6,
+                             "single_side_max_trading_sessions": 1,
+                             "external_fallback_file": str(args.fallback_prices) if available_external else None,
+                         }, warnings=warnings)
     write_json(run / "metadata/run_info.json", info)
     write_json(run / "metadata/data_sources.json", info["finlab_data_sources"])
     write_json(run / "metadata/warnings.json", warnings)
